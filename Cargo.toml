@@ -1,0 +1,58 @@
+[package]
+name = "id-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["AMAI Labs"]
+description = "AMAI Identity Service - Agent registration and messaging"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrent data structures
+dashmap = "6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Random
+rand = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# WebSocket
+futures = "0.3"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+
+# HTTP client for RPC
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
