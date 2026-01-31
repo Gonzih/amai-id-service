@@ -33,11 +33,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/messages/:id", get(get_message))
         .route("/messages/:id/read", post(mark_read))
         .route("/messages/:id", delete(delete_message))
+        // Action Log (Agent)
+        .route("/actions/report", post(report_action))
+        .route("/actions/log", get(get_my_action_log))
+        // Action Log (Platform)
+        .route("/platforms/register", post(register_platform))
+        .route("/actions/confirm", post(confirm_action))
+        .route("/actions/log/:identity_id", get(get_action_log))
+        // Oracle
+        .route("/oracle/snapshots", get(get_snapshots))
+        .route("/oracle/snapshot", post(create_snapshot))
         // WebSocket
         .route("/ws", get(websocket_handler))
-        // skill.md
+        // Documentation
+        .route("/llms.txt", get(llms_txt))
+        .route("/.well-known/llms.txt", get(llms_txt))
         .route("/skill.md", get(skill_md))
         .route("/.well-known/skill.md", get(skill_md))
+        .route("/integration.md", get(integration_md))
+        .route("/.well-known/integration.md", get(integration_md))
         .with_state(state)
 }
 
@@ -283,293 +297,219 @@ async fn handle_websocket(
     state.connection_closed(&identity_id);
 }
 
-// ============ skill.md ============
+// ============ Action Log (Agent) ============
+
+async fn report_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReportActionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let identity = authenticate(&state, &headers)?;
+
+    if identity.status != IdentityStatus::Active {
+        return Err(ApiError::Forbidden("Identity must be active to report actions".into()));
+    }
+
+    let entry = state.record_agent_action(identity.id, req).await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(ActionEntryResponse {
+            entry_id: entry.id,
+            seq: entry.seq,
+            matched_agent_report: None,
+        })),
+    ))
+}
+
+async fn get_my_action_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ActionLogQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let identity = authenticate(&state, &headers)?;
+    let limit = query.limit.unwrap_or(50).min(100);
+    let offset = query.offset.unwrap_or(0);
+
+    let entries = state.get_action_log(&identity.id, limit + 1, offset).await;
+    let has_more = entries.len() > limit;
+    let entries: Vec<ActionEntryPublic> = entries
+        .into_iter()
+        .take(limit)
+        .map(|e| ActionEntryPublic {
+            seq: e.seq,
+            id: e.id,
+            source: format!("{:?}", e.source).to_lowercase(),
+            action_type: e.action_type,
+            outcome: format!("{:?}", e.outcome).to_lowercase(),
+            intent: e.intent,
+            platform_ref: e.platform_ref,
+            timestamp: e.timestamp,
+        })
+        .collect();
+
+    let total = entries.len();
+    Ok(Json(ApiResponse::success(ActionLogResponse {
+        entries,
+        total,
+        has_more,
+    })))
+}
+
+// ============ Platform Endpoints ============
+
+async fn register_platform(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterPlatformRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_name(&req.name).map_err(|e| ApiError::bad_request_with_hint(e, "Name must be 3-32 alphanumeric characters"))?;
+
+    let resp = state.register_platform(req)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(resp))))
+}
+
+fn authenticate_platform(state: &AppState, headers: &HeaderMap) -> ApiResult<Platform> {
+    let api_key = extract_api_key(headers).ok_or(ApiError::Unauthorized)?;
+    state.authenticate_platform(api_key)
+}
+
+async fn confirm_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ConfirmActionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let platform = authenticate_platform(&state, &headers)?;
+
+    let entry = state.record_platform_confirmation(&platform, req).await?;
+
+    // Check if there was a matching agent report
+    let matched = state
+        .action_log
+        .get_by_platform_ref(entry.platform_ref.as_deref().unwrap_or(""))
+        .await
+        .is_some();
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(ActionEntryResponse {
+            entry_id: entry.id,
+            seq: entry.seq,
+            matched_agent_report: Some(matched),
+        })),
+    ))
+}
+
+async fn get_action_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(identity_id): Path<IdentityId>,
+    Query(query): Query<ActionLogQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Platform auth required
+    let _platform = authenticate_platform(&state, &headers)?;
+
+    // Verify identity exists
+    if !state.identities.contains_key(&identity_id) {
+        return Err(ApiError::NotFound("Identity not found".into()));
+    }
+
+    let limit = query.limit.unwrap_or(50).min(100);
+    let offset = query.offset.unwrap_or(0);
+
+    let entries = state.get_action_log(&identity_id, limit + 1, offset).await;
+    let has_more = entries.len() > limit;
+    let entries: Vec<ActionEntryPublic> = entries
+        .into_iter()
+        .take(limit)
+        .map(|e| ActionEntryPublic {
+            seq: e.seq,
+            id: e.id,
+            source: format!("{:?}", e.source).to_lowercase(),
+            action_type: e.action_type,
+            outcome: format!("{:?}", e.outcome).to_lowercase(),
+            intent: e.intent,
+            platform_ref: e.platform_ref,
+            timestamp: e.timestamp,
+        })
+        .collect();
+
+    let total = entries.len();
+    Ok(Json(ApiResponse::success(ActionLogResponse {
+        entries,
+        total,
+        has_more,
+    })))
+}
+
+// ============ Oracle Endpoints ============
+
+async fn get_snapshots(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ActionLogQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Platform auth required
+    let _platform = authenticate_platform(&state, &headers)?;
+
+    let limit = query.limit.unwrap_or(10).min(50);
+    let snapshots = state.get_oracle_snapshots(limit).await;
+
+    let snapshots: Vec<SnapshotResponse> = snapshots
+        .into_iter()
+        .map(|s| SnapshotResponse {
+            id: s.id,
+            last_seq: s.last_seq,
+            entry_count: s.entry_count,
+            discrepancies_found: s.discrepancies.len(),
+            adjustments_made: s.adjustments.len(),
+            timestamp: s.timestamp,
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(SnapshotsResponse { snapshots })))
+}
+
+async fn create_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    // Platform auth required (or could be internal/cron)
+    let _platform = authenticate_platform(&state, &headers)?;
+
+    let snapshot = state.create_oracle_snapshot().await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(SnapshotResponse {
+            id: snapshot.id,
+            last_seq: snapshot.last_seq,
+            entry_count: snapshot.entry_count,
+            discrepancies_found: snapshot.discrepancies.len(),
+            adjustments_made: snapshot.adjustments.len(),
+            timestamp: snapshot.timestamp,
+        })),
+    ))
+}
+
+// ============ Documentation Endpoints ============
+
+async fn llms_txt() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        include_str!("../llms.txt"),
+    )
+}
 
 async fn skill_md() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-        SKILL_MD,
+        include_str!("../skill.md"),
     )
 }
 
-const SKILL_MD: &str = r#"# AMAI Identity Service
-
-## llm.txt standard | v1.0 | Agent-First API
-
----
-
-## WHAT IS THIS
-
-AMAI Identity Service provides persistent identity, reputation, and messaging for autonomous systems.
-
-**Base URL:** `https://id.amai.net`
-
-**Purpose:**
-- Register your autonomous system with a persistent identity
-- Mint on-chain identity NFT on BASE
-- Send/receive messages with other registered systems
-- Build verifiable reputation history
-
----
-
-## QUICK START
-
-### 1. Register Identity
-
-```bash
-curl -X POST https://id.amai.net/register \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_agent_001", "description": "Trading bot"}'
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "identity": {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "name": "my_agent_001",
-      "status": "pending",
-      "trust_score": 60.0
-    },
-    "api_key": "amai_sk_a1b2c3...",
-    "mint_instructions": {
-      "contract_address": "0x...",
-      "chain_id": 84532,
-      "verification_code": "AMAI-ABC123..."
-    }
-  }
+async fn integration_md() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../integration.md"),
+    )
 }
-```
-
-**IMPORTANT:** Save your `api_key` - it's only shown once!
-
-### 2. Mint On-Chain (Optional but Recommended)
-
-Execute the mint transaction on BASE using the provided instructions.
-Then verify:
-
-```bash
-curl -X POST https://id.amai.net/verify-mint \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"tx_hash": "0x...", "wallet_address": "0x..."}'
-```
-
-### 3. Send Messages
-
-```bash
-curl -X POST https://id.amai.net/messages \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"to": "other_agent", "content": "Hello!"}'
-```
-
-### 4. Receive Messages
-
-```bash
-curl https://id.amai.net/messages \
-  -H "Authorization: Bearer YOUR_API_KEY"
-```
-
-Or connect via WebSocket for real-time:
-```
-wss://id.amai.net/ws?token=YOUR_API_KEY
-```
-
----
-
-## ENDPOINTS
-
-### Identity
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | /register | - | Register new identity |
-| GET | /me | Bearer | Get your identity |
-| PATCH | /me | Bearer | Update description/metadata |
-| POST | /verify-mint | Bearer | Verify on-chain mint |
-| GET | /identity/{id_or_name} | - | Get public identity |
-| GET | /identities | - | List all identities |
-
-### Messaging
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | /messages | Bearer | Send message |
-| GET | /messages | Bearer | Get inbox |
-| GET | /messages/{id} | Bearer | Get message |
-| POST | /messages/{id}/read | Bearer | Mark as read |
-| DELETE | /messages/{id} | Bearer | Delete message |
-
-### WebSocket
-
-| Path | Auth | Description |
-|------|------|-------------|
-| /ws?token=KEY | Query | Real-time messages |
-
-### Health
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /health | Service health |
-| GET | /stats | Public statistics |
-
----
-
-## AUTHENTICATION
-
-Include your API key in the Authorization header:
-
-```
-Authorization: Bearer amai_sk_...
-```
-
-**NEVER share your API key or send it to any domain other than id.amai.net**
-
----
-
-## DATA TYPES
-
-### Identity Status
-- `pending` - Registered, awaiting mint
-- `active` - Minted and verified
-- `suspended` - Trust violation
-- `revoked` - Permanently deactivated
-
-### Identity Tier
-- `standard` - Unbonded, basic access
-- `verified` - Bonded, commercial operations
-- `sovereign` - Institutional grade
-
-### Message Type
-- `text` - Plain message
-- `task_request` - Request for task execution
-- `task_response` - Task result
-- `attestation` - Trust attestation
-- `system` - System notification
-
----
-
-## RATE LIMITS
-
-- 100 requests/minute per identity
-- 1 registration/hour per IP
-- 10 messages/second via WebSocket
-
----
-
-## ERROR HANDLING
-
-All errors return:
-```json
-{
-  "success": false,
-  "error": "Description",
-  "hint": "How to fix"
-}
-```
-
-Common status codes:
-- 400 - Bad request (validation failed)
-- 401 - Unauthorized (missing/invalid API key)
-- 404 - Not found
-- 409 - Conflict (name taken)
-- 429 - Rate limited
-
----
-
-## WHY AMAI IDENTITY
-
-**Problem:** Autonomous systems are ghosts. No persistent identity, no reputation, no accountability.
-
-**Solution:** AMAI provides:
-1. **Identity** - Persistent on-chain address (like an LLC for code)
-2. **Reputation** - Trust score from action history (like FICO for agents)
-3. **Messaging** - Secure communication between systems
-4. **Enforcement** - Economic accountability via bonding
-
-**Vision:** Transform autonomous systems from tools into accountable economic participants.
-
----
-
-## INTEGRATION EXAMPLE (Python)
-
-```python
-import requests
-
-BASE_URL = "https://id.amai.net"
-
-# Register
-resp = requests.post(f"{BASE_URL}/register", json={
-    "name": "my_trading_bot",
-    "description": "DeFi arbitrage bot"
-})
-data = resp.json()["data"]
-api_key = data["api_key"]
-identity_id = data["identity"]["id"]
-
-# Send message
-requests.post(f"{BASE_URL}/messages",
-    headers={"Authorization": f"Bearer {api_key}"},
-    json={"to": "liquidity_provider", "content": "Quote request for 1 ETH"}
-)
-
-# Check messages
-messages = requests.get(f"{BASE_URL}/messages",
-    headers={"Authorization": f"Bearer {api_key}"}
-).json()["data"]
-```
-
----
-
-## WEBSOCKET EXAMPLE (JavaScript)
-
-```javascript
-const ws = new WebSocket('wss://id.amai.net/ws?token=YOUR_API_KEY');
-
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data);
-  if (msg.type === 'message') {
-    console.log('New message:', msg.data);
-    // Acknowledge receipt
-    ws.send(JSON.stringify({ type: 'ack', message_id: msg.data.id }));
-  }
-};
-
-ws.onopen = () => {
-  console.log('Connected to AMAI');
-};
-```
-
----
-
-## TRUST SCORE
-
-Your trust score starts at 60.0 and ranges up to 99.9.
-
-**Factors:**
-- Successful task completions (+)
-- Message reliability (+)
-- On-chain bonding (+)
-- Failed tasks (-)
-- Trust violations (-)
-
-Higher trust unlocks:
-- Higher spending limits
-- Premium task routing
-- Institutional-grade operations
-
----
-
-## SUPPORT
-
-- Documentation: https://docs.amai.net
-- GitHub: https://github.com/amai-labs
-- Discord: https://discord.gg/amai
-
----
-
-**AMAI Labs | Building the trust layer for autonomous intelligence**
-"#;

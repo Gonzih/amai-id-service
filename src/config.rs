@@ -59,6 +59,10 @@ impl Config {
     pub fn state_file_path(&self) -> PathBuf {
         self.data_dir.join("state.json")
     }
+
+    pub fn action_log_path(&self) -> PathBuf {
+        self.data_dir.join("action_log.json")
+    }
 }
 
 impl Default for Config {

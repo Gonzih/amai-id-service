@@ -309,3 +309,157 @@ impl From<&Identity> for IdentityPublic {
         }
     }
 }
+
+// ============ Action Log API Types ============
+
+/// Agent action report request
+#[derive(Debug, Deserialize)]
+pub struct ReportActionRequest {
+    /// Action type/category
+    pub action_type: String,
+    /// Outcome of the action
+    pub outcome: ActionOutcomeInput,
+    /// Platform reference ID (for correlation with platform confirmation)
+    #[serde(default)]
+    pub platform_ref: Option<String>,
+    /// Agent's stated intent (why they took this action)
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// Agent's reasoning (how they decided)
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Action payload/details
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Platform action confirmation request
+#[derive(Debug, Deserialize)]
+pub struct ConfirmActionRequest {
+    /// Identity ID of the agent
+    pub identity_id: IdentityId,
+    /// Action type/category
+    pub action_type: String,
+    /// Outcome of the action
+    pub outcome: ActionOutcomeInput,
+    /// Platform reference ID (for correlation)
+    pub platform_ref: String,
+    /// When the action occurred
+    pub timestamp: DateTime<Utc>,
+    /// Action payload/details
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOutcomeInput {
+    Success,
+    Failure,
+    Pending,
+    Disputed,
+}
+
+/// Action entry response
+#[derive(Debug, Serialize)]
+pub struct ActionEntryResponse {
+    pub entry_id: Uuid,
+    pub seq: u64,
+    pub matched_agent_report: Option<bool>,
+}
+
+/// Action log query params
+#[derive(Debug, Deserialize, Default)]
+pub struct ActionLogQuery {
+    /// Limit (default 50, max 100)
+    pub limit: Option<usize>,
+    /// Offset for pagination
+    pub offset: Option<usize>,
+    /// Only entries since this sequence
+    pub since_seq: Option<u64>,
+}
+
+/// Action log response
+#[derive(Debug, Serialize)]
+pub struct ActionLogResponse {
+    pub entries: Vec<ActionEntryPublic>,
+    pub total: usize,
+    pub has_more: bool,
+}
+
+/// Public action entry
+#[derive(Debug, Serialize)]
+pub struct ActionEntryPublic {
+    pub seq: u64,
+    pub id: Uuid,
+    pub source: String,
+    pub action_type: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_ref: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+// ============ Platform API Types ============
+
+/// Platform registration request
+#[derive(Debug, Deserialize)]
+pub struct RegisterPlatformRequest {
+    /// Platform name
+    pub name: String,
+    /// Description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Webhook URL for notifications
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Allowed action types this platform can confirm
+    #[serde(default)]
+    pub allowed_actions: Vec<String>,
+}
+
+/// Platform entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Platform {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing)]
+    pub api_key_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub webhook_secret: String,
+    pub allowed_actions: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Platform registration response
+#[derive(Debug, Serialize)]
+pub struct RegisterPlatformResponse {
+    pub platform_id: String,
+    pub api_key: String,
+    pub webhook_secret: String,
+}
+
+// ============ Oracle API Types ============
+
+/// Oracle snapshot response
+#[derive(Debug, Serialize)]
+pub struct SnapshotResponse {
+    pub id: Uuid,
+    pub last_seq: u64,
+    pub entry_count: usize,
+    pub discrepancies_found: usize,
+    pub adjustments_made: usize,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Snapshots list response
+#[derive(Debug, Serialize)]
+pub struct SnapshotsResponse {
+    pub snapshots: Vec<SnapshotResponse>,
+}

@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, Notify};
 use tokio::time::interval;
 use uuid::Uuid;
 
+use crate::action_log::{ActionLog, ActionOutcome, ActionEntry, OracleSnapshot};
 use crate::auth::{generate_api_key, generate_verification_code, hash_api_key};
 use crate::config::Config;
 use crate::error::{ApiError, ApiResult};
@@ -30,6 +31,12 @@ pub struct AppState {
     pub connection_count: DashMap<IdentityId, usize>,
     /// Total messages sent (for stats)
     pub total_messages: AtomicU64,
+    /// Append-only action log (Kafka-like)
+    pub action_log: ActionLog,
+    /// Registered platforms
+    pub platforms: DashMap<String, Platform>,
+    /// Platform API key hash → platform ID lookup
+    pub platform_key_index: DashMap<String, String>,
     /// Configuration
     pub config: Config,
     /// Start time for uptime calculation
@@ -38,6 +45,8 @@ pub struct AppState {
     dirty: AtomicBool,
     /// Notify for immediate save
     persist_notify: Notify,
+    /// Shutdown flag
+    shutdown: AtomicBool,
     /// Last persist time
     pub last_persist: std::sync::RwLock<Option<DateTime<Utc>>>,
 }
@@ -54,10 +63,14 @@ impl AppState {
             broadcast: tx,
             connection_count: DashMap::new(),
             total_messages: AtomicU64::new(0),
+            action_log: ActionLog::new(),
+            platforms: DashMap::new(),
+            platform_key_index: DashMap::new(),
             config,
             start_time: Instant::now(),
             dirty: AtomicBool::new(false),
             persist_notify: Notify::new(),
+            shutdown: AtomicBool::new(false),
             last_persist: std::sync::RwLock::new(None),
         })
     }
@@ -66,32 +79,44 @@ impl AppState {
     pub async fn load_from_disk(self: &Arc<Self>) -> anyhow::Result<()> {
         let path = self.config.state_file_path();
 
-        if !path.exists() {
+        if path.exists() {
+            let json = tokio::fs::read_to_string(&path).await?;
+            let snapshot: StateSnapshot = serde_json::from_str(&json)?;
+
+            for (id, identity) in snapshot.identities {
+                self.name_index.insert(identity.name.clone(), id);
+                self.api_key_index.insert(identity.api_key_hash.clone(), id);
+                self.identities.insert(id, identity);
+            }
+
+            for (id, msgs) in snapshot.messages {
+                self.messages.insert(id, msgs);
+            }
+
+            for platform in snapshot.platforms {
+                self.platform_key_index
+                    .insert(platform.api_key_hash.clone(), platform.id.clone());
+                self.platforms.insert(platform.id.clone(), platform);
+            }
+
+            self.total_messages
+                .store(snapshot.total_messages, Ordering::SeqCst);
+
+            tracing::info!(
+                "Loaded state: {} identities, {} message queues, {} platforms",
+                self.identities.len(),
+                self.messages.len(),
+                self.platforms.len()
+            );
+        } else {
             tracing::info!("No existing state file, starting fresh");
-            return Ok(());
         }
 
-        let json = tokio::fs::read_to_string(&path).await?;
-        let snapshot: StateSnapshot = serde_json::from_str(&json)?;
-
-        for (id, identity) in snapshot.identities {
-            self.name_index.insert(identity.name.clone(), id);
-            self.api_key_index.insert(identity.api_key_hash.clone(), id);
-            self.identities.insert(id, identity);
+        // Load action log
+        let action_log_path = self.config.action_log_path();
+        if let Err(e) = self.action_log.load_from_file(&action_log_path).await {
+            tracing::warn!("Failed to load action log: {}", e);
         }
-
-        for (id, msgs) in snapshot.messages {
-            self.messages.insert(id, msgs);
-        }
-
-        self.total_messages
-            .store(snapshot.total_messages, Ordering::SeqCst);
-
-        tracing::info!(
-            "Loaded state: {} identities, {} message queues",
-            self.identities.len(),
-            self.messages.len()
-        );
 
         Ok(())
     }
@@ -105,23 +130,53 @@ impl AppState {
             let mut ticker = interval(persist_interval);
 
             loop {
+                // Check for shutdown
+                if state.shutdown.load(Ordering::SeqCst) {
+                    tracing::info!("Persister shutting down, final save...");
+                    if let Err(e) = state.save_all().await {
+                        tracing::error!("Failed final persist: {}", e);
+                    }
+                    break;
+                }
+
                 tokio::select! {
                     _ = ticker.tick() => {
                         if state.dirty.swap(false, Ordering::SeqCst) {
-                            if let Err(e) = state.save_to_disk().await {
+                            if let Err(e) = state.save_all().await {
                                 tracing::error!("Failed to persist state: {}", e);
                             }
                         }
                     }
                     _ = state.persist_notify.notified() => {
                         state.dirty.store(false, Ordering::SeqCst);
-                        if let Err(e) = state.save_to_disk().await {
+                        if let Err(e) = state.save_all().await {
                             tracing::error!("Failed to persist state: {}", e);
                         }
                     }
                 }
             }
         })
+    }
+
+    /// Signal shutdown - triggers final persistence
+    pub fn signal_shutdown(&self) {
+        tracing::info!("Shutdown signaled");
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.persist_notify.notify_one();
+    }
+
+    /// Check if shutdown was requested
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Save all state (identities, messages, platforms, action log)
+    pub async fn save_all(&self) -> anyhow::Result<()> {
+        self.save_to_disk().await?;
+        self.action_log
+            .save_to_file(&self.config.action_log_path())
+            .await?;
+        Ok(())
     }
 
     /// Save state to disk
@@ -136,6 +191,11 @@ impl AppState {
                 .messages
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
+                .collect(),
+            platforms: self
+                .platforms
+                .iter()
+                .map(|r| r.value().clone())
                 .collect(),
             total_messages: self.total_messages.load(Ordering::SeqCst),
             saved_at: Utc::now(),
@@ -155,9 +215,10 @@ impl AppState {
         *self.last_persist.write().unwrap() = Some(Utc::now());
 
         tracing::info!(
-            "State persisted: {} identities, {} message queues",
+            "State persisted: {} identities, {} message queues, {} platforms",
             snapshot.identities.len(),
-            snapshot.messages.len()
+            snapshot.messages.len(),
+            snapshot.platforms.len()
         );
 
         Ok(())
@@ -539,6 +600,157 @@ impl AppState {
 struct StateSnapshot {
     identities: Vec<(IdentityId, Identity)>,
     messages: Vec<(IdentityId, Vec<Message>)>,
+    #[serde(default)]
+    platforms: Vec<Platform>,
     total_messages: u64,
     saved_at: DateTime<Utc>,
+}
+
+// ============ Platform Methods ============
+
+impl AppState {
+    /// Register a new platform
+    pub fn register_platform(&self, req: RegisterPlatformRequest) -> ApiResult<RegisterPlatformResponse> {
+        let name_lower = req.name.to_lowercase();
+
+        // Check name uniqueness
+        if self.platforms.iter().any(|p| p.value().name.to_lowercase() == name_lower) {
+            return Err(ApiError::Conflict("Platform name already taken".into()));
+        }
+
+        let id = format!("plat_{}", &Uuid::new_v4().to_string()[..12]);
+        let api_key = generate_api_key("amai_pk_");
+        let api_key_hash = hash_api_key(&api_key);
+        let webhook_secret = format!("whsec_{}", &Uuid::new_v4().to_string().replace("-", ""));
+
+        let platform = Platform {
+            id: id.clone(),
+            name: req.name,
+            description: req.description,
+            api_key_hash: api_key_hash.clone(),
+            webhook_url: req.webhook_url,
+            webhook_secret: webhook_secret.clone(),
+            allowed_actions: req.allowed_actions,
+            created_at: Utc::now(),
+        };
+
+        self.platforms.insert(id.clone(), platform);
+        self.platform_key_index.insert(api_key_hash, id.clone());
+        self.mark_dirty();
+
+        Ok(RegisterPlatformResponse {
+            platform_id: id,
+            api_key,
+            webhook_secret,
+        })
+    }
+
+    /// Authenticate platform by API key
+    pub fn authenticate_platform(&self, api_key: &str) -> ApiResult<Platform> {
+        let hash = hash_api_key(api_key);
+        let id = self
+            .platform_key_index
+            .get(&hash)
+            .map(|r| r.value().clone())
+            .ok_or(ApiError::Unauthorized)?;
+        let platform = self
+            .platforms
+            .get(&id)
+            .map(|r| r.value().clone())
+            .ok_or(ApiError::Unauthorized)?;
+        Ok(platform)
+    }
+
+    /// Record agent action
+    pub async fn record_agent_action(
+        &self,
+        identity_id: IdentityId,
+        req: ReportActionRequest,
+    ) -> ActionEntry {
+        let outcome = match req.outcome {
+            ActionOutcomeInput::Success => ActionOutcome::Success,
+            ActionOutcomeInput::Failure => ActionOutcome::Failure,
+            ActionOutcomeInput::Pending => ActionOutcome::Pending,
+            ActionOutcomeInput::Disputed => ActionOutcome::Disputed,
+        };
+
+        self.mark_dirty();
+
+        self.action_log
+            .record_agent_action(
+                identity_id,
+                req.action_type,
+                outcome,
+                req.payload.unwrap_or(serde_json::Value::Null),
+                req.intent,
+                req.reasoning,
+                req.platform_ref,
+            )
+            .await
+    }
+
+    /// Record platform confirmation
+    pub async fn record_platform_confirmation(
+        &self,
+        platform: &Platform,
+        req: ConfirmActionRequest,
+    ) -> ApiResult<ActionEntry> {
+        // Verify identity exists
+        if !self.identities.contains_key(&req.identity_id) {
+            return Err(ApiError::NotFound("Identity not found".into()));
+        }
+
+        // Check if platform can confirm this action type
+        if !platform.allowed_actions.is_empty()
+            && !platform.allowed_actions.contains(&req.action_type)
+        {
+            return Err(ApiError::Forbidden(format!(
+                "Platform not allowed to confirm action type: {}",
+                req.action_type
+            )));
+        }
+
+        let outcome = match req.outcome {
+            ActionOutcomeInput::Success => ActionOutcome::Success,
+            ActionOutcomeInput::Failure => ActionOutcome::Failure,
+            ActionOutcomeInput::Pending => ActionOutcome::Pending,
+            ActionOutcomeInput::Disputed => ActionOutcome::Disputed,
+        };
+
+        self.mark_dirty();
+
+        Ok(self
+            .action_log
+            .record_platform_confirmation(
+                req.identity_id,
+                platform.id.clone(),
+                req.action_type,
+                outcome,
+                req.payload.unwrap_or(serde_json::Value::Null),
+                req.platform_ref,
+                req.timestamp,
+            )
+            .await)
+    }
+
+    /// Get action log entries for an identity
+    pub async fn get_action_log(
+        &self,
+        identity_id: &IdentityId,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<ActionEntry> {
+        self.action_log.get_by_identity(identity_id, limit, offset).await
+    }
+
+    /// Create oracle snapshot
+    pub async fn create_oracle_snapshot(&self) -> OracleSnapshot {
+        self.mark_dirty();
+        self.action_log.create_snapshot().await
+    }
+
+    /// Get oracle snapshots
+    pub async fn get_oracle_snapshots(&self, limit: usize) -> Vec<OracleSnapshot> {
+        self.action_log.get_snapshots(limit).await
+    }
 }

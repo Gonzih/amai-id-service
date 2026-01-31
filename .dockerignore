@@ -4,3 +4,5 @@ data/
 .gitignore
 *.md
 !skill.md
+!integration.md
+!llms.txt
