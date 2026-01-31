@@ -135,7 +135,7 @@ async fn verify_mint(
     Json(req): Json<VerifyMintRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = authenticate(&state, &headers)?;
-    let resp = state.verify_mint(&identity.id, req).await?;
+    let resp = state.verify_mint(&identity.id, req)?;
     Ok(Json(ApiResponse::success(resp)))
 }
 

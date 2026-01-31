@@ -373,13 +373,16 @@ impl AppState {
     }
 
     /// Verify mint transaction
-    pub async fn verify_mint(
+    pub fn verify_mint(
         &self,
         id: &IdentityId,
-        _req: VerifyMintRequest,
+        req: VerifyMintRequest,
     ) -> ApiResult<VerifyMintResponse> {
         // TODO: Implement actual blockchain verification
         // For now, simulate successful verification
+
+        // Get token_id before acquiring mutable reference
+        let token_id = (self.identities.len() as u64) + 1;
 
         let mut identity = self
             .identities
@@ -392,20 +395,20 @@ impl AppState {
             ));
         }
 
-        // Simulate getting token_id from blockchain
-        let token_id = (self.identities.len() as u64) + 1;
-
         identity.status = IdentityStatus::Active;
-        identity.wallet_address = Some(_req.wallet_address);
+        identity.wallet_address = Some(req.wallet_address);
         identity.token_id = Some(token_id);
         identity.last_active = Utc::now();
 
-        self.mark_dirty();
-
-        Ok(VerifyMintResponse {
+        let result = VerifyMintResponse {
             identity: identity.clone(),
             token_id,
-        })
+        };
+
+        drop(identity); // Release lock before mark_dirty
+        self.mark_dirty();
+
+        Ok(result)
     }
 
     /// Send message
