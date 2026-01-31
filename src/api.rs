@@ -22,6 +22,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Health & stats
         .route("/health", get(health))
         .route("/stats", get(stats))
+        // Chain & contract info
+        .route("/chains", get(get_chains))
+        .route("/contracts", get(get_contracts))
         // Identity management
         .route("/register", post(register))
         .route("/me", get(get_me))
@@ -79,6 +82,73 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(ApiResponse::success(state.stats()))
+}
+
+// ============ Chain & Contract Endpoints ============
+
+/// Get supported chains and their configurations
+async fn get_chains(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::config::format_version;
+
+    let chains: Vec<serde_json::Value> = state
+        .config
+        .chains
+        .iter()
+        .map(|(chain, config)| {
+            serde_json::json!({
+                "chain": chain,
+                "chain_id": chain.chain_id(),
+                "is_evm": chain.is_evm(),
+                "is_solana": chain.is_solana(),
+                "is_testnet": chain.is_testnet(),
+                "rpc_url": config.rpc_url,
+                "contract_address": config.contract_address,
+                "contract_version": config.contract_version,
+                "contract_version_string": format_version(config.contract_version),
+            })
+        })
+        .collect();
+
+    Json(ApiResponse::success(serde_json::json!({
+        "supported_chains": chains,
+        "current_version": state.config.contract_version,
+        "current_version_string": format_version(state.config.contract_version),
+    })))
+}
+
+/// Get contract addresses for all supported chains
+async fn get_contracts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::config::format_version;
+    use crate::types::Chain;
+
+    let contracts: std::collections::HashMap<String, serde_json::Value> = state
+        .config
+        .chains
+        .iter()
+        .map(|(chain, config)| {
+            let chain_key = match chain {
+                Chain::BaseSepolia => "base_sepolia",
+                Chain::BaseMainnet => "base_mainnet",
+                Chain::SolanaDevnet => "solana_devnet",
+                Chain::SolanaMainnet => "solana_mainnet",
+            };
+            (
+                chain_key.to_string(),
+                serde_json::json!({
+                    "address": config.contract_address,
+                    "version": config.contract_version,
+                    "version_string": format_version(config.contract_version),
+                    "rpc_url": config.rpc_url,
+                }),
+            )
+        })
+        .collect();
+
+    Json(ApiResponse::success(serde_json::json!({
+        "contracts": contracts,
+        "abi_url": "/contracts/abi",
+        "source_url": "https://github.com/Gonzih/amai-id-service/tree/main/contracts",
+    })))
 }
 
 // ============ Identity Endpoints ============
@@ -637,13 +707,6 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 <a href="/health">Health Check</a>
                 <a href="/stats">Stats API</a>
             </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Quick Start</div>
-            <pre><code>curl -X POST https://id.amai.net/register \
-  -H "Content-Type: application/json" \
-  -d '{{"name": "my_agent", "description": "My autonomous agent"}}'</code></pre>
         </div>
 
         <div class="section">

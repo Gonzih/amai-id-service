@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::action_log::{ActionLog, ActionOutcome, ActionEntry, OracleSnapshot};
 use crate::auth::{generate_api_key, generate_verification_code, hash_api_key};
-use crate::config::Config;
+use crate::config::{Config, format_version};
 use crate::error::{ApiError, ApiResult};
 use crate::types::*;
 
@@ -373,13 +373,58 @@ impl AppState {
     }
 
     /// Verify mint transaction
+    ///
+    /// Validates that:
+    /// 1. The contract address matches our deployed contract for the specified chain
+    /// 2. The chain is supported
+    /// 3. The transaction exists (TODO: actual blockchain verification)
     pub fn verify_mint(
         &self,
         id: &IdentityId,
         req: VerifyMintRequest,
     ) -> ApiResult<VerifyMintResponse> {
+        // Validate chain is supported
+        let chain_config = self.config.get_chain_config(req.chain).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Chain {:?} is not supported. Supported chains: {:?}",
+                req.chain,
+                self.config.chains.keys().collect::<Vec<_>>()
+            ))
+        })?;
+
+        // Validate contract address matches our deployed contract
+        let contract_valid = chain_config
+            .contract_address
+            .eq_ignore_ascii_case(&req.contract_address);
+
+        if !contract_valid {
+            let contract_verification = ContractVerification {
+                valid: false,
+                version: 0,
+                version_string: "unknown".into(),
+                chain: req.chain,
+                contract_address: req.contract_address.clone(),
+                error: Some(format!(
+                    "Invalid contract address. Expected: {}, got: {}",
+                    chain_config.contract_address, req.contract_address
+                )),
+            };
+
+            return Err(ApiError::BadRequest(format!(
+                "Contract verification failed: {}",
+                contract_verification.error.as_ref().unwrap()
+            )));
+        }
+
         // TODO: Implement actual blockchain verification
-        // For now, simulate successful verification
+        // For EVM: call eth_getTransactionReceipt and verify:
+        //   - Transaction exists and succeeded
+        //   - Logs contain AgentMinted event
+        //   - Event data matches (owner, tokenId)
+        // For Solana: call getTransaction and verify:
+        //   - Transaction exists and succeeded
+        //   - Contains AgentMinted event
+        //   - Event data matches
 
         // Get token_id before acquiring mutable reference
         let token_id = (self.identities.len() as u64) + 1;
@@ -400,13 +445,32 @@ impl AppState {
         identity.token_id = Some(token_id);
         identity.last_active = Utc::now();
 
+        // Build contract verification result
+        let contract_verification = ContractVerification {
+            valid: true,
+            version: chain_config.contract_version,
+            version_string: format_version(chain_config.contract_version),
+            chain: req.chain,
+            contract_address: chain_config.contract_address.clone(),
+            error: None,
+        };
+
         let result = VerifyMintResponse {
             identity: identity.clone(),
             token_id,
+            contract: contract_verification,
         };
 
         drop(identity); // Release lock before mark_dirty
         self.mark_dirty();
+
+        tracing::info!(
+            "Mint verified: identity={}, chain={:?}, contract={}, version={}",
+            id,
+            req.chain,
+            chain_config.contract_address,
+            format_version(chain_config.contract_version)
+        );
 
         Ok(result)
     }

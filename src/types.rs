@@ -154,13 +154,74 @@ pub struct RegisterResponse {
     pub mint_instructions: MintInstructions,
 }
 
+/// Supported blockchain networks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Chain {
+    /// Base Sepolia testnet (chain_id: 84532)
+    BaseSepolia,
+    /// Base mainnet (chain_id: 8453)
+    BaseMainnet,
+    /// Solana devnet
+    SolanaDevnet,
+    /// Solana mainnet
+    SolanaMainnet,
+}
+
+impl Chain {
+    /// Get chain ID for EVM chains, None for Solana
+    pub fn chain_id(&self) -> Option<u64> {
+        match self {
+            Chain::BaseSepolia => Some(84532),
+            Chain::BaseMainnet => Some(8453),
+            Chain::SolanaDevnet | Chain::SolanaMainnet => None,
+        }
+    }
+
+    /// Check if this is an EVM chain
+    pub fn is_evm(&self) -> bool {
+        matches!(self, Chain::BaseSepolia | Chain::BaseMainnet)
+    }
+
+    /// Check if this is Solana
+    pub fn is_solana(&self) -> bool {
+        matches!(self, Chain::SolanaDevnet | Chain::SolanaMainnet)
+    }
+
+    /// Check if this is a testnet
+    pub fn is_testnet(&self) -> bool {
+        matches!(self, Chain::BaseSepolia | Chain::SolanaDevnet)
+    }
+}
+
 /// Verify mint request
 #[derive(Debug, Deserialize)]
 pub struct VerifyMintRequest {
-    /// Transaction hash of mint
+    /// Transaction hash (EVM) or signature (Solana)
     pub tx_hash: String,
     /// Wallet address that minted
     pub wallet_address: Address,
+    /// Chain where mint occurred
+    pub chain: Chain,
+    /// Contract address used for minting
+    pub contract_address: String,
+}
+
+/// Contract verification result
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractVerification {
+    /// Whether the contract is valid
+    pub valid: bool,
+    /// Contract version number (e.g., 1000000 for 1.0.0)
+    pub version: u64,
+    /// Human-readable version string
+    pub version_string: String,
+    /// Chain the contract is on
+    pub chain: Chain,
+    /// Contract address
+    pub contract_address: String,
+    /// Error message if invalid
+    pub error: Option<String>,
 }
 
 /// Verify mint response
@@ -168,6 +229,8 @@ pub struct VerifyMintRequest {
 pub struct VerifyMintResponse {
     pub identity: Identity,
     pub token_id: u64,
+    /// Contract verification details
+    pub contract: ContractVerification,
 }
 
 /// Send message request
