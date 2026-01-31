@@ -51,6 +51,15 @@ reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+tokio-test = "0.4"
+tempfile = "3"
+wiremock = "0.6"
+serial_test = "3"
+once_cell = "1"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [profile.release]
 lto = true

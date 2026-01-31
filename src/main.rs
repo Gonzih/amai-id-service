@@ -6,16 +6,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod action_log;
-mod api;
-mod auth;
-mod config;
-mod error;
-mod state;
-mod types;
-
-use config::Config;
-use state::AppState;
+use id_service::config::Config;
+use id_service::state::AppState;
+use id_service::api;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
