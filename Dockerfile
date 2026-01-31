@@ -29,12 +29,9 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/id-service /app/id-service
 
-# Create data directory
-RUN mkdir -p /data
-
 ENV HOST=0.0.0.0
 ENV PORT=8080
-ENV DATA_DIR=/data
+ENV DATA_DIR=/mnt/storage
 ENV RUST_LOG=id_service=info,tower_http=info
 
 EXPOSE 8080
