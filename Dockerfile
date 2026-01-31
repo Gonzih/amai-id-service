@@ -1,4 +1,4 @@
-FROM rust:1.75-slim as builder
+FROM rust:1.83-slim as builder
 
 WORKDIR /app
 
@@ -13,8 +13,9 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm -rf src
 
-# Copy actual source
+# Copy actual source and docs
 COPY src ./src
+COPY skill.md integration.md llms.txt ./
 
 # Build for release
 RUN touch src/main.rs && cargo build --release
