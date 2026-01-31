@@ -17,6 +17,8 @@ use crate::types::*;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
+        // Index page
+        .route("/", get(index_page))
         // Health & stats
         .route("/health", get(health))
         .route("/stats", get(stats))
@@ -489,6 +491,183 @@ async fn create_snapshot(
             timestamp: snapshot.timestamp,
         })),
     ))
+}
+
+// ============ Index Page ============
+
+async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stats = state.stats();
+    let action_count = state.action_log.len().await;
+    let uptime = state.start_time.elapsed().as_secs();
+
+    let uptime_str = if uptime < 60 {
+        format!("{}s", uptime)
+    } else if uptime < 3600 {
+        format!("{}m {}s", uptime / 60, uptime % 60)
+    } else if uptime < 86400 {
+        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
+    } else {
+        format!("{}d {}h", uptime / 86400, (uptime % 86400) / 3600)
+    };
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AMAI Identity Service</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 2rem;
+        }}
+        .container {{ max-width: 800px; margin: 0 auto; }}
+        h1 {{
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(90deg, #00ff88, #00ccff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .tagline {{ color: #888; margin-bottom: 2rem; }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }}
+        .stat {{
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 1.5rem;
+            text-align: center;
+        }}
+        .stat-value {{
+            font-size: 2rem;
+            font-weight: bold;
+            color: #00ff88;
+        }}
+        .stat-label {{ color: #888; font-size: 0.9rem; margin-top: 0.5rem; }}
+        .links {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }}
+        a {{
+            color: #00ccff;
+            text-decoration: none;
+            padding: 0.75rem 1.5rem;
+            border: 1px solid #00ccff;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }}
+        a:hover {{
+            background: #00ccff;
+            color: #0a0a0a;
+        }}
+        .section {{ margin-bottom: 2rem; }}
+        .section-title {{ color: #00ff88; margin-bottom: 1rem; font-size: 1.2rem; }}
+        code {{
+            background: #1a1a1a;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }}
+        pre {{
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 1rem;
+            overflow-x: auto;
+            margin: 1rem 0;
+        }}
+        .footer {{
+            margin-top: 3rem;
+            padding-top: 2rem;
+            border-top: 1px solid #333;
+            color: #666;
+            font-size: 0.9rem;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AMAI Identity Service</h1>
+        <p class="tagline">Trust infrastructure for autonomous systems</p>
+
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Total Agents</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Active (Verified)</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Pending</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Messages</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Actions Logged</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Uptime</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Documentation</div>
+            <div class="links">
+                <a href="/skill.md">Agent API (skill.md)</a>
+                <a href="/integration.md">Platform Integration</a>
+                <a href="/llms.txt">LLMs.txt</a>
+                <a href="/health">Health Check</a>
+                <a href="/stats">Stats API</a>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Quick Start</div>
+            <pre><code>curl -X POST https://id.amai.net/register \
+  -H "Content-Type: application/json" \
+  -d '{{"name": "my_agent", "description": "My autonomous agent"}}'</code></pre>
+        </div>
+
+        <div class="section">
+            <div class="section-title">The Trust Loop</div>
+            <pre><code>Agent registers → Mints on-chain identity → Operates on platforms
+       ↑                                              ↓
+       ←←←←←←← Trust score updates ←←←←←←← Actions logged & verified</code></pre>
+        </div>
+
+        <div class="footer">
+            AMAI Labs | Building the trust layer for autonomous intelligence
+        </div>
+    </div>
+</body>
+</html>"#,
+        stats.total_identities,
+        stats.active_identities,
+        stats.pending_identities,
+        stats.total_messages,
+        action_count,
+        uptime_str,
+    );
+
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
 // ============ Documentation Endpoints ============
