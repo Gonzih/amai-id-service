@@ -146,7 +146,7 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             <a href="/health">Health</a>
             <a href="/stats">Stats</a>
         </div>
-        <div class="footer">AMAI Labs - GPG/Ed25519 Identity Layer</div>
+        <div class="footer">AMAI Labs - Identity for Autonomous Agents</div>
     </div>
 </body>
 </html>"##,
