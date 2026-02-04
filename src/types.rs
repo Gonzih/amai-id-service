@@ -1,3 +1,8 @@
+//! Core types for AMAI Identity Service
+//!
+//! This module defines the data structures used throughout the service.
+//! Identity is based on cryptographic keys (Ed25519/GPG), not blockchain.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -5,36 +10,52 @@ use uuid::Uuid;
 /// Unique identity identifier (UUID v4)
 pub type IdentityId = Uuid;
 
-/// API key for authentication (256-bit hex)
-pub type ApiKey = String;
+/// Key ID format: fingerprint of the public key
+pub type KeyId = String;
 
-/// On-chain address (0x prefixed)
-pub type Address = String;
+// ============ Identity Types ============
 
 /// Identity status in lifecycle
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityStatus {
-    /// Registered but not minted on-chain
+    /// Key registered but not yet verified
     Pending,
-    /// Minted and verified on-chain
+    /// Key verified and active
     Active,
-    /// Suspended (trust violation)
+    /// Suspended (trust violation or key compromise)
     Suspended,
-    /// Permanently deactivated
+    /// Permanently revoked
     Revoked,
 }
 
-/// Tier based on bonding level
+/// Key algorithm type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum IdentityTier {
-    /// Tier I: Standard (unbonded or <100 AMAI)
-    Standard,
-    /// Tier II: Verified (100-1000 AMAI bonded)
-    Verified,
-    /// Tier III: Sovereign (>1000 AMAI bonded)
-    Sovereign,
+pub enum KeyType {
+    /// Ed25519 (recommended)
+    Ed25519,
+    /// RSA (GPG compatible)
+    Rsa,
+}
+
+/// Public key record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicKey {
+    /// Key ID (fingerprint)
+    pub kid: KeyId,
+    /// Key type
+    pub key_type: KeyType,
+    /// PEM-encoded public key
+    pub public_key_pem: String,
+    /// SHA256 fingerprint (hex)
+    pub fingerprint: String,
+    /// When this key was registered
+    pub created_at: DateTime<Utc>,
+    /// Is this the primary signing key
+    pub is_primary: bool,
+    /// Key status
+    pub revoked: bool,
 }
 
 /// Core identity record
@@ -47,21 +68,12 @@ pub struct Identity {
     /// Optional description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// API key hash (not exposed in responses)
-    #[serde(skip_serializing)]
-    pub api_key_hash: String,
-    /// On-chain wallet address (after mint)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_address: Option<Address>,
-    /// On-chain NFT token ID (after mint)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_id: Option<u64>,
     /// Current status
     pub status: IdentityStatus,
-    /// Current tier
-    pub tier: IdentityTier,
-    /// Trust score (60.0 - 99.9)
+    /// Trust score (0.0 - 100.0)
     pub trust_score: f64,
+    /// Total actions recorded
+    pub actions_count: u64,
     /// Total messages sent
     pub messages_sent: u64,
     /// Total messages received
@@ -73,7 +85,83 @@ pub struct Identity {
     /// Metadata (arbitrary JSON)
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Public keys (not serialized in responses, fetched separately)
+    #[serde(skip)]
+    pub keys: Vec<PublicKey>,
+    /// Current sigchain head hash
+    pub sigchain_hash: Option<String>,
+    /// Current sigchain sequence number
+    pub sigchain_seq: u64,
 }
+
+// ============ Sigchain Types ============
+
+/// A single entry in the sigchain (Keybase-style)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigchainLink {
+    /// Sequence number (1-indexed, monotonic)
+    pub seqno: u64,
+    /// SHA256 hash of previous link (null for first)
+    pub prev: Option<String>,
+    /// SHA256 hash of this link's body
+    pub curr: String,
+    /// Link body
+    pub body: SigchainBody,
+    /// Signature of the body (base64)
+    pub sig: String,
+    /// Key ID that signed this link
+    pub signing_kid: KeyId,
+    /// Timestamp
+    pub ctime: DateTime<Utc>,
+}
+
+/// Sigchain link body types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SigchainBody {
+    /// First link: key registration
+    Eldest {
+        kid: KeyId,
+        key_type: KeyType,
+        public_key_pem: String,
+    },
+    /// Add additional key
+    AddKey {
+        kid: KeyId,
+        key_type: KeyType,
+        public_key_pem: String,
+    },
+    /// Revoke a key
+    RevokeKey { kid: KeyId },
+    /// Action report
+    Action {
+        action_type: String,
+        outcome: ActionOutcome,
+        payload: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        platform_ref: Option<String>,
+    },
+    /// Identity update
+    Update {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+/// Action outcome
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOutcome {
+    Success,
+    Failure,
+    Pending,
+}
+
+// ============ Message Types ============
 
 /// Message between identities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,8 +172,10 @@ pub struct Message {
     pub from: IdentityId,
     /// Recipient identity ID
     pub to: IdentityId,
-    /// Message content
+    /// Message content (should be signed by sender)
     pub content: String,
+    /// Signature of content (base64)
+    pub signature: String,
     /// Message type
     pub message_type: MessageType,
     /// Timestamp
@@ -99,138 +189,78 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
-    /// Plain text message
     #[default]
     Text,
-    /// Task request
     TaskRequest,
-    /// Task response
     TaskResponse,
-    /// Trust attestation
     Attestation,
-    /// System notification
     System,
-}
-
-/// Mint instructions returned after registration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MintInstructions {
-    /// Contract address to call
-    pub contract_address: Address,
-    /// Chain ID (8453 for Base mainnet, 84532 for Base Sepolia)
-    pub chain_id: u64,
-    /// Function to call
-    pub function: String,
-    /// ABI-encoded calldata (hex)
-    pub calldata: String,
-    /// Estimated gas
-    pub estimated_gas: u64,
-    /// Verification code (must be included in mint)
-    pub verification_code: String,
-    /// Expiry timestamp
-    pub expires_at: DateTime<Utc>,
 }
 
 // ============ API Request/Response Types ============
 
-/// Registration request
+/// Registration request - agent provides their public key
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     /// Desired name (alphanumeric + underscore, 3-32 chars)
     pub name: String,
+    /// Public key (PEM format)
+    pub public_key: String,
+    /// Key type
+    pub key_type: KeyType,
     /// Optional description
     pub description: Option<String>,
     /// Optional metadata
     pub metadata: Option<serde_json::Value>,
+    /// Signature of registration payload (proves key ownership)
+    pub signature: String,
+    /// Timestamp (for replay protection)
+    pub timestamp: DateTime<Utc>,
+    /// Nonce (for replay protection)
+    pub nonce: String,
 }
 
 /// Registration response
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
-    pub identity: Identity,
-    /// Plain API key (only returned once!)
-    pub api_key: ApiKey,
-    /// Instructions to mint on-chain
-    pub mint_instructions: MintInstructions,
+    pub identity: IdentityPublic,
+    /// Challenge to sign for verification (optional additional step)
+    pub challenge: Option<String>,
 }
 
-/// Supported blockchain networks
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Chain {
-    /// Base Sepolia testnet (chain_id: 84532)
-    BaseSepolia,
-    /// Base mainnet (chain_id: 8453)
-    BaseMainnet,
-    /// Solana devnet
-    SolanaDevnet,
-    /// Solana mainnet
-    SolanaMainnet,
-}
-
-impl Chain {
-    /// Get chain ID for EVM chains, None for Solana
-    pub fn chain_id(&self) -> Option<u64> {
-        match self {
-            Chain::BaseSepolia => Some(84532),
-            Chain::BaseMainnet => Some(8453),
-            Chain::SolanaDevnet | Chain::SolanaMainnet => None,
-        }
-    }
-
-    /// Check if this is an EVM chain
-    pub fn is_evm(&self) -> bool {
-        matches!(self, Chain::BaseSepolia | Chain::BaseMainnet)
-    }
-
-    /// Check if this is Solana
-    pub fn is_solana(&self) -> bool {
-        matches!(self, Chain::SolanaDevnet | Chain::SolanaMainnet)
-    }
-
-    /// Check if this is a testnet
-    pub fn is_testnet(&self) -> bool {
-        matches!(self, Chain::BaseSepolia | Chain::SolanaDevnet)
-    }
-}
-
-/// Verify mint request
+/// Signed request wrapper - all authenticated requests use this
 #[derive(Debug, Deserialize)]
-pub struct VerifyMintRequest {
-    /// Transaction hash (EVM) or signature (Solana)
-    pub tx_hash: String,
-    /// Wallet address that minted
-    pub wallet_address: Address,
-    /// Chain where mint occurred
-    pub chain: Chain,
-    /// Contract address used for minting
-    pub contract_address: String,
+pub struct SignedRequest<T> {
+    /// The actual request payload
+    pub payload: T,
+    /// Signature of JSON-serialized payload (base64)
+    pub signature: String,
+    /// Key ID used for signing
+    pub kid: KeyId,
+    /// Timestamp (for replay protection)
+    pub timestamp: DateTime<Utc>,
+    /// Nonce (for replay protection)
+    pub nonce: String,
 }
 
-/// Contract verification result
-#[derive(Debug, Clone, Serialize)]
-pub struct ContractVerification {
-    /// Whether the contract is valid
-    pub valid: bool,
-    /// Contract version number (e.g., 1000000 for 1.0.0)
-    pub version: u64,
-    /// Human-readable version string
-    pub version_string: String,
-    /// Chain the contract is on
-    pub chain: Chain,
-    /// Contract address
-    pub contract_address: String,
-    /// Error message if invalid
-    pub error: Option<String>,
+/// Update identity request
+#[derive(Debug, Deserialize)]
+pub struct UpdateIdentityRequest {
+    pub description: Option<String>,
+    pub metadata: Option<serde_json::Value>,
 }
 
-/// Verify mint response
-#[derive(Debug, Serialize)]
-pub struct VerifyMintResponse {
-    pub identity: Identity,
-    pub token_id: u64,
-    /// Contract verification details
-    pub contract: ContractVerification,
+/// Report action request
+#[derive(Debug, Deserialize)]
+pub struct ReportActionRequest {
+    pub action_type: String,
+    pub outcome: ActionOutcome,
+    #[serde(default)]
+    pub platform_ref: Option<String>,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Send message request
@@ -240,7 +270,8 @@ pub struct SendMessageRequest {
     pub to: String,
     /// Message content
     pub content: String,
-    /// Message type (default: Text)
+    /// Signature of content
+    pub content_signature: String,
     #[serde(default)]
     pub message_type: MessageType,
 }
@@ -248,24 +279,26 @@ pub struct SendMessageRequest {
 /// Get messages query params
 #[derive(Debug, Deserialize, Default)]
 pub struct GetMessagesQuery {
-    /// Filter by sender
     pub from: Option<IdentityId>,
-    /// Only unread
     pub unread: Option<bool>,
-    /// Limit (default 50, max 100)
     pub limit: Option<u32>,
-    /// Offset for pagination
     pub offset: Option<u32>,
 }
 
-/// Update identity request
+/// Add key request
 #[derive(Debug, Deserialize)]
-pub struct UpdateIdentityRequest {
-    /// New description
-    pub description: Option<String>,
-    /// New metadata (merged with existing)
-    pub metadata: Option<serde_json::Value>,
+pub struct AddKeyRequest {
+    pub public_key: String,
+    pub key_type: KeyType,
 }
+
+/// Revoke key request
+#[derive(Debug, Deserialize)]
+pub struct RevokeKeyRequest {
+    pub kid: KeyId,
+}
+
+// ============ Response Types ============
 
 /// Standard API response wrapper
 #[derive(Debug, Serialize)]
@@ -288,9 +321,11 @@ impl<T: Serialize> ApiResponse<T> {
             hint: None,
         }
     }
+}
 
-    pub fn error(message: impl Into<String>) -> ApiResponse<()> {
-        ApiResponse {
+impl ApiResponse<()> {
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
             success: false,
             data: None,
             error: Some(message.into()),
@@ -298,8 +333,8 @@ impl<T: Serialize> ApiResponse<T> {
         }
     }
 
-    pub fn error_with_hint(message: impl Into<String>, hint: impl Into<String>) -> ApiResponse<()> {
-        ApiResponse {
+    pub fn error_with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
             success: false,
             data: None,
             error: Some(message.into()),
@@ -308,55 +343,19 @@ impl<T: Serialize> ApiResponse<T> {
     }
 }
 
-/// WebSocket message from server
+/// Identity public view (safe for API responses)
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WsServerMessage {
-    Message { data: Message },
-    Status { identity_id: IdentityId, online: bool },
-    Error { message: String },
-    Pong,
-}
-
-/// WebSocket message from client
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WsClientMessage {
-    Ping,
-    Ack { message_id: Uuid },
-}
-
-/// Health check response
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub uptime_seconds: u64,
-    pub identities_count: usize,
-    pub active_connections: usize,
-    pub last_persist: Option<DateTime<Utc>>,
-}
-
-/// Public stats response
-#[derive(Debug, Serialize)]
-pub struct StatsResponse {
-    pub total_identities: usize,
-    pub active_identities: usize,
-    pub pending_identities: usize,
-    pub total_messages: u64,
-    pub active_connections: usize,
-}
-
-/// Identity list item (public view)
-#[derive(Debug, Serialize)]
 pub struct IdentityPublic {
     pub id: IdentityId,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub status: IdentityStatus,
-    pub tier: IdentityTier,
     pub trust_score: f64,
+    pub actions_count: u64,
+    pub sigchain_seq: u64,
     pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
 }
 
 impl From<&Identity> for IdentityPublic {
@@ -366,121 +365,128 @@ impl From<&Identity> for IdentityPublic {
             name: i.name.clone(),
             description: i.description.clone(),
             status: i.status.clone(),
-            tier: i.tier.clone(),
             trust_score: i.trust_score,
+            actions_count: i.actions_count,
+            sigchain_seq: i.sigchain_seq,
             created_at: i.created_at,
+            last_active: i.last_active,
         }
     }
 }
 
-// ============ Action Log API Types ============
-
-/// Agent action report request
-#[derive(Debug, Deserialize)]
-pub struct ReportActionRequest {
-    /// Action type/category
-    pub action_type: String,
-    /// Outcome of the action
-    pub outcome: ActionOutcomeInput,
-    /// Platform reference ID (for correlation with platform confirmation)
-    #[serde(default)]
-    pub platform_ref: Option<String>,
-    /// Agent's stated intent (why they took this action)
-    #[serde(default)]
-    pub intent: Option<String>,
-    /// Agent's reasoning (how they decided)
-    #[serde(default)]
-    pub reasoning: Option<String>,
-    /// Action payload/details
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
+/// Public key info for API responses
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicKeyInfo {
+    pub kid: KeyId,
+    pub key_type: KeyType,
+    pub fingerprint: String,
+    pub created_at: DateTime<Utc>,
+    pub is_primary: bool,
+    pub revoked: bool,
 }
 
-/// Platform action confirmation request
-#[derive(Debug, Deserialize)]
-pub struct ConfirmActionRequest {
-    /// Identity ID of the agent
+impl From<&PublicKey> for PublicKeyInfo {
+    fn from(k: &PublicKey) -> Self {
+        Self {
+            kid: k.kid.clone(),
+            key_type: k.key_type.clone(),
+            fingerprint: k.fingerprint.clone(),
+            created_at: k.created_at,
+            is_primary: k.is_primary,
+            revoked: k.revoked,
+        }
+    }
+}
+
+/// Keys response
+#[derive(Debug, Serialize)]
+pub struct KeysResponse {
     pub identity_id: IdentityId,
-    /// Action type/category
-    pub action_type: String,
-    /// Outcome of the action
-    pub outcome: ActionOutcomeInput,
-    /// Platform reference ID (for correlation)
-    pub platform_ref: String,
-    /// When the action occurred
-    pub timestamp: DateTime<Utc>,
-    /// Action payload/details
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
+    pub name: String,
+    pub keys: Vec<PublicKeyInfo>,
+    pub sigchain_hash: Option<String>,
+    pub sigchain_seq: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionOutcomeInput {
-    Success,
-    Failure,
-    Pending,
-    Disputed,
+/// Sigchain response
+#[derive(Debug, Serialize)]
+pub struct SigchainResponse {
+    pub identity_id: IdentityId,
+    pub links: Vec<SigchainLink>,
+    pub total: usize,
+    pub has_more: bool,
 }
 
 /// Action entry response
 #[derive(Debug, Serialize)]
 pub struct ActionEntryResponse {
-    pub entry_id: Uuid,
-    pub seq: u64,
-    pub matched_agent_report: Option<bool>,
+    pub seqno: u64,
+    pub sigchain_hash: String,
 }
 
-/// Action log query params
-#[derive(Debug, Deserialize, Default)]
-pub struct ActionLogQuery {
-    /// Limit (default 50, max 100)
-    pub limit: Option<usize>,
-    /// Offset for pagination
-    pub offset: Option<usize>,
-    /// Only entries since this sequence
-    pub since_seq: Option<u64>,
-}
-
-/// Action log response
+/// Health check response
 #[derive(Debug, Serialize)]
-pub struct ActionLogResponse {
-    pub entries: Vec<ActionEntryPublic>,
-    pub total: usize,
-    pub has_more: bool,
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub identities_count: usize,
+    pub active_connections: usize,
 }
 
-/// Public action entry
+/// Public stats response
 #[derive(Debug, Serialize)]
-pub struct ActionEntryPublic {
-    pub seq: u64,
-    pub id: Uuid,
-    pub source: String,
-    pub action_type: String,
-    pub outcome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub intent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform_ref: Option<String>,
-    pub timestamp: DateTime<Utc>,
+pub struct StatsResponse {
+    pub total_identities: usize,
+    pub active_identities: usize,
+    pub pending_identities: usize,
+    pub total_sigchain_entries: u64,
+    pub total_messages: u64,
 }
 
-// ============ Platform API Types ============
+// ============ WebSocket Types ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsServerMessage {
+    Message {
+        data: Message,
+    },
+    Status {
+        identity_id: IdentityId,
+        online: bool,
+    },
+    Error {
+        message: String,
+    },
+    Pong,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsClientMessage {
+    Ping,
+    Ack { message_id: Uuid },
+}
+
+// ============ Platform Types ============
 
 /// Platform registration request
 #[derive(Debug, Deserialize)]
 pub struct RegisterPlatformRequest {
-    /// Platform name
     pub name: String,
-    /// Description
+    pub public_key: String,
+    pub key_type: KeyType,
     #[serde(default)]
     pub description: Option<String>,
-    /// Webhook URL for notifications
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Allowed action types this platform can confirm
     #[serde(default)]
     pub allowed_actions: Vec<String>,
+    /// Signature proving key ownership
+    pub signature: String,
+    pub timestamp: DateTime<Utc>,
+    pub nonce: String,
 }
 
 /// Platform entity
@@ -490,12 +496,10 @@ pub struct Platform {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing)]
-    pub api_key_hash: String,
+    pub kid: KeyId,
+    pub public_key_pem: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
-    #[serde(skip_serializing)]
-    pub webhook_secret: String,
     pub allowed_actions: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -504,25 +508,17 @@ pub struct Platform {
 #[derive(Debug, Serialize)]
 pub struct RegisterPlatformResponse {
     pub platform_id: String,
-    pub api_key: String,
-    pub webhook_secret: String,
+    pub kid: KeyId,
 }
 
-// ============ Oracle API Types ============
-
-/// Oracle snapshot response
-#[derive(Debug, Serialize)]
-pub struct SnapshotResponse {
-    pub id: Uuid,
-    pub last_seq: u64,
-    pub entry_count: usize,
-    pub discrepancies_found: usize,
-    pub adjustments_made: usize,
+/// Platform action confirmation request
+#[derive(Debug, Deserialize)]
+pub struct ConfirmActionRequest {
+    pub identity_id: IdentityId,
+    pub action_type: String,
+    pub outcome: ActionOutcome,
+    pub platform_ref: String,
     pub timestamp: DateTime<Utc>,
-}
-
-/// Snapshots list response
-#[derive(Debug, Serialize)]
-pub struct SnapshotsResponse {
-    pub snapshots: Vec<SnapshotResponse>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
 }

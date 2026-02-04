@@ -1,42 +1,51 @@
+//! Application state for AMAI Identity Service
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Notify};
 use tokio::time::interval;
 use uuid::Uuid;
 
-use crate::action_log::{ActionLog, ActionOutcome, ActionEntry, OracleSnapshot};
-use crate::auth::{generate_api_key, generate_verification_code, hash_api_key};
-use crate::config::{Config, format_version};
+use crate::auth::{
+    create_public_key, validate_description, validate_metadata, validate_name,
+    verify_registration_signature, NonceStore, RegistrationParams,
+};
+use crate::config::Config;
 use crate::error::{ApiError, ApiResult};
+use crate::sigchain::{eldest_body, SigchainStore};
 use crate::types::*;
 
 /// Global application state
 pub struct AppState {
     /// All identities indexed by ID
     pub identities: DashMap<IdentityId, Identity>,
-    /// Identity name → ID lookup
+    /// Identity name -> ID lookup
     pub name_index: DashMap<String, IdentityId>,
-    /// API key hash → ID lookup
-    pub api_key_index: DashMap<String, IdentityId>,
+    /// Key ID -> Identity ID lookup
+    pub kid_index: DashMap<KeyId, IdentityId>,
+    /// Public keys indexed by KID
+    pub keys: DashMap<KeyId, PublicKey>,
     /// Pending messages per identity
     pub messages: DashMap<IdentityId, Vec<Message>>,
     /// Broadcast channel for real-time updates
     pub broadcast: broadcast::Sender<WsServerMessage>,
     /// Active WebSocket connection count per identity
     pub connection_count: DashMap<IdentityId, usize>,
-    /// Total messages sent (for stats)
+    /// Total messages sent
     pub total_messages: AtomicU64,
-    /// Append-only action log (Kafka-like)
-    pub action_log: ActionLog,
+    /// Sigchain storage
+    pub sigchain: SigchainStore,
     /// Registered platforms
     pub platforms: DashMap<String, Platform>,
-    /// Platform API key hash → platform ID lookup
-    pub platform_key_index: DashMap<String, String>,
+    /// Platform KID -> platform ID lookup
+    pub platform_kid_index: DashMap<KeyId, String>,
+    /// Nonce store for replay protection
+    pub nonces: NonceStore,
     /// Configuration
     pub config: Config,
     /// Start time for uptime calculation
@@ -54,18 +63,21 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Arc<Self> {
         let (tx, _) = broadcast::channel(1024);
+        let sigchain_dir = config.sigchain_dir();
 
         Arc::new(Self {
             identities: DashMap::new(),
             name_index: DashMap::new(),
-            api_key_index: DashMap::new(),
+            kid_index: DashMap::new(),
+            keys: DashMap::new(),
             messages: DashMap::new(),
             broadcast: tx,
             connection_count: DashMap::new(),
             total_messages: AtomicU64::new(0),
-            action_log: ActionLog::new(),
+            sigchain: SigchainStore::new(sigchain_dir),
             platforms: DashMap::new(),
-            platform_key_index: DashMap::new(),
+            platform_kid_index: DashMap::new(),
+            nonces: NonceStore::new(config.nonce_expiry),
             config,
             start_time: Instant::now(),
             dirty: AtomicBool::new(false),
@@ -75,7 +87,7 @@ impl AppState {
         })
     }
 
-    /// Load state from disk if exists
+    /// Load state from disk
     pub async fn load_from_disk(self: &Arc<Self>) -> anyhow::Result<()> {
         let path = self.config.state_file_path();
 
@@ -83,9 +95,12 @@ impl AppState {
             let json = tokio::fs::read_to_string(&path).await?;
             let snapshot: StateSnapshot = serde_json::from_str(&json)?;
 
-            for (id, identity) in snapshot.identities {
-                self.name_index.insert(identity.name.clone(), id);
-                self.api_key_index.insert(identity.api_key_hash.clone(), id);
+            for (id, mut identity) in snapshot.identities {
+                for key in identity.keys.drain(..) {
+                    self.kid_index.insert(key.kid.clone(), id);
+                    self.keys.insert(key.kid.clone(), key);
+                }
+                self.name_index.insert(identity.name.to_lowercase(), id);
                 self.identities.insert(id, identity);
             }
 
@@ -94,8 +109,8 @@ impl AppState {
             }
 
             for platform in snapshot.platforms {
-                self.platform_key_index
-                    .insert(platform.api_key_hash.clone(), platform.id.clone());
+                self.platform_kid_index
+                    .insert(platform.kid.clone(), platform.id.clone());
                 self.platforms.insert(platform.id.clone(), platform);
             }
 
@@ -103,19 +118,19 @@ impl AppState {
                 .store(snapshot.total_messages, Ordering::SeqCst);
 
             tracing::info!(
-                "Loaded state: {} identities, {} message queues, {} platforms",
+                "Loaded state: {} identities, {} keys, {} platforms",
                 self.identities.len(),
-                self.messages.len(),
+                self.keys.len(),
                 self.platforms.len()
             );
         } else {
             tracing::info!("No existing state file, starting fresh");
         }
 
-        // Load action log
-        let action_log_path = self.config.action_log_path();
-        if let Err(e) = self.action_log.load_from_file(&action_log_path).await {
-            tracing::warn!("Failed to load action log: {}", e);
+        // Load sigchains
+        match self.sigchain.load_all().await {
+            Ok(count) => tracing::info!("Loaded {} sigchains", count),
+            Err(e) => tracing::warn!("Failed to load sigchains: {}", e),
         }
 
         Ok(())
@@ -130,7 +145,6 @@ impl AppState {
             let mut ticker = interval(persist_interval);
 
             loop {
-                // Check for shutdown
                 if state.shutdown.load(Ordering::SeqCst) {
                     tracing::info!("Persister shutting down, final save...");
                     if let Err(e) = state.save_all().await {
@@ -158,7 +172,7 @@ impl AppState {
         })
     }
 
-    /// Signal shutdown - triggers final persistence
+    /// Signal shutdown
     pub fn signal_shutdown(&self) {
         tracing::info!("Shutdown signaled");
         self.shutdown.store(true, Ordering::SeqCst);
@@ -170,133 +184,151 @@ impl AppState {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Save all state (identities, messages, platforms, action log)
+    /// Save all state
     pub async fn save_all(&self) -> anyhow::Result<()> {
         self.save_to_disk().await?;
-        self.action_log
-            .save_to_file(&self.config.action_log_path())
-            .await?;
+        self.sigchain.save_all().await?;
         Ok(())
     }
 
     /// Save state to disk
     async fn save_to_disk(&self) -> anyhow::Result<()> {
-        let snapshot = StateSnapshot {
-            identities: self
-                .identities
+        let mut identities_with_keys = Vec::new();
+
+        for r in self.identities.iter() {
+            let mut identity = r.value().clone();
+            identity.keys = self
+                .keys
                 .iter()
-                .map(|r| (*r.key(), r.value().clone()))
-                .collect(),
+                .filter(|k| {
+                    self.kid_index
+                        .get(k.key())
+                        .map(|v| *v == identity.id)
+                        .unwrap_or(false)
+                })
+                .map(|k| k.value().clone())
+                .collect();
+            identities_with_keys.push((*r.key(), identity));
+        }
+
+        let snapshot = StateSnapshot {
+            identities: identities_with_keys,
             messages: self
                 .messages
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
                 .collect(),
-            platforms: self
-                .platforms
-                .iter()
-                .map(|r| r.value().clone())
-                .collect(),
+            platforms: self.platforms.iter().map(|r| r.value().clone()).collect(),
             total_messages: self.total_messages.load(Ordering::SeqCst),
             saved_at: Utc::now(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)?;
-
-        // Ensure data directory exists
         tokio::fs::create_dir_all(&self.config.data_dir).await?;
 
-        // Atomic write (write to temp, rename)
         let path = self.config.state_file_path();
         let temp_path = path.with_extension("tmp");
         tokio::fs::write(&temp_path, &json).await?;
         tokio::fs::rename(&temp_path, &path).await?;
 
         *self.last_persist.write().unwrap() = Some(Utc::now());
-
-        tracing::info!(
-            "State persisted: {} identities, {} message queues, {} platforms",
-            snapshot.identities.len(),
-            snapshot.messages.len(),
-            snapshot.platforms.len()
-        );
-
+        tracing::info!("State persisted: {} identities", snapshot.identities.len());
         Ok(())
     }
 
-    /// Mark state as dirty
     fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
-    /// Register new identity
-    pub fn register(&self, req: RegisterRequest) -> ApiResult<RegisterResponse> {
-        // Check name uniqueness
+    // ============ Identity Operations ============
+
+    /// Register new identity with public key
+    pub async fn register(&self, req: RegisterRequest) -> ApiResult<RegisterResponse> {
+        validate_name(&req.name)
+            .map_err(|e| ApiError::bad_request_with_hint(e, "Name: 3-32 alphanumeric chars"))?;
+
+        if let Some(ref desc) = req.description {
+            validate_description(desc).map_err(|e| ApiError::BadRequest(e.into()))?;
+        }
+
+        if let Some(ref metadata) = req.metadata {
+            validate_metadata(metadata).map_err(|e| ApiError::BadRequest(e.into()))?;
+        }
+
         let name_lower = req.name.to_lowercase();
         if self.name_index.contains_key(&name_lower) {
             return Err(ApiError::Conflict("Name already taken".into()));
         }
 
-        // Generate identity
-        let id = Uuid::new_v4();
-        let api_key = generate_api_key(&self.config.api_key_prefix);
-        let api_key_hash = hash_api_key(&api_key);
-        let verification_code = generate_verification_code();
+        // Verify registration signature
+        let params = RegistrationParams {
+            name: &req.name,
+            public_key_pem: &req.public_key,
+            key_type: &req.key_type,
+            signature: &req.signature,
+            timestamp: &req.timestamp,
+            nonce: &req.nonce,
+        };
+        verify_registration_signature(&params, &self.nonces, self.config.max_clock_skew)?;
 
+        let public_key = create_public_key(&req.public_key, req.key_type.clone(), true)?;
+
+        let id = Uuid::new_v4();
         let now = Utc::now();
+
         let identity = Identity {
             id,
             name: req.name.clone(),
             description: req.description,
-            api_key_hash: api_key_hash.clone(),
-            wallet_address: None,
-            token_id: None,
-            status: IdentityStatus::Pending,
-            tier: IdentityTier::Standard,
+            status: IdentityStatus::Active,
             trust_score: 60.0,
+            actions_count: 0,
             messages_sent: 0,
             messages_received: 0,
             created_at: now,
             last_active: now,
             metadata: req.metadata.unwrap_or(serde_json::Value::Null),
+            keys: vec![],
+            sigchain_hash: None,
+            sigchain_seq: 0,
         };
 
-        // Generate mint instructions
-        let mint_instructions = MintInstructions {
-            contract_address: self.config.identity_contract.clone(),
-            chain_id: self.config.chain_id,
-            function: "mintIdentity(string,bytes32)".into(),
-            calldata: format!(
-                "0x{:0>64}{:0>64}",
-                hex::encode(req.name.as_bytes()),
-                hex::encode(verification_code.as_bytes())
-            ),
-            estimated_gas: 150000,
-            verification_code: verification_code.clone(),
-            expires_at: now + ChronoDuration::hours(24),
-        };
+        // Create eldest sigchain link
+        let eldest = eldest_body(
+            public_key.kid.clone(),
+            public_key.key_type.clone(),
+            public_key.public_key_pem.clone(),
+        );
 
-        // Store
+        let link = self
+            .sigchain
+            .append(&id, eldest, req.signature.clone(), &public_key)
+            .await?;
+
+        let mut identity = identity;
+        identity.sigchain_hash = Some(link.curr.clone());
+        identity.sigchain_seq = link.seqno;
+
         self.identities.insert(id, identity.clone());
         self.name_index.insert(name_lower, id);
-        self.api_key_index.insert(api_key_hash, id);
+        self.kid_index.insert(public_key.kid.clone(), id);
+        self.keys.insert(public_key.kid.clone(), public_key);
         self.messages.insert(id, Vec::new());
 
         self.mark_dirty();
+        tracing::info!("Registered identity: {} ({})", req.name, id);
 
         Ok(RegisterResponse {
-            identity,
-            api_key,
-            mint_instructions,
+            identity: IdentityPublic::from(&identity),
+            challenge: None,
         })
     }
 
-    /// Authenticate by API key
-    pub fn authenticate(&self, api_key: &str) -> ApiResult<Identity> {
-        let hash = hash_api_key(api_key);
+    /// Authenticate by key ID
+    pub fn authenticate(&self, kid: &KeyId) -> ApiResult<Identity> {
         let id = self
-            .api_key_index
-            .get(&hash)
+            .kid_index
+            .get(kid)
             .map(|r| *r.value())
             .ok_or(ApiError::Unauthorized)?;
         let identity = self
@@ -304,6 +336,10 @@ impl AppState {
             .get(&id)
             .map(|r| r.value().clone())
             .ok_or(ApiError::Unauthorized)?;
+        let key = self.keys.get(kid).ok_or(ApiError::Unauthorized)?;
+        if key.revoked {
+            return Err(ApiError::signature("Key has been revoked"));
+        }
         Ok(identity)
     }
 
@@ -315,27 +351,13 @@ impl AppState {
             .ok_or_else(|| ApiError::NotFound("Identity not found".into()))
     }
 
-    /// Get identity by name
-    pub fn get_identity_by_name(&self, name: &str) -> ApiResult<Identity> {
-        let name_lower = name.to_lowercase();
-        let id = self
-            .name_index
-            .get(&name_lower)
-            .map(|r| *r.value())
-            .ok_or_else(|| ApiError::NotFound("Identity not found".into()))?;
-        self.get_identity(&id)
-    }
-
     /// Resolve identity ID from ID string or name
     pub fn resolve_identity(&self, id_or_name: &str) -> ApiResult<IdentityId> {
-        // Try parsing as UUID first
         if let Ok(id) = Uuid::parse_str(id_or_name) {
             if self.identities.contains_key(&id) {
                 return Ok(id);
             }
         }
-
-        // Try as name
         let name_lower = id_or_name.to_lowercase();
         self.name_index
             .get(&name_lower)
@@ -343,281 +365,51 @@ impl AppState {
             .ok_or_else(|| ApiError::NotFound("Identity not found".into()))
     }
 
-    /// Update identity
-    pub fn update_identity(&self, id: &IdentityId, req: UpdateIdentityRequest) -> ApiResult<Identity> {
-        let mut identity = self
-            .identities
-            .get_mut(id)
-            .ok_or_else(|| ApiError::NotFound("Identity not found".into()))?;
-
-        if let Some(desc) = req.description {
-            identity.description = Some(desc);
-        }
-
-        if let Some(metadata) = req.metadata {
-            // Merge metadata if both are objects, otherwise replace
-            match (&mut identity.metadata, metadata) {
-                (serde_json::Value::Object(existing), serde_json::Value::Object(new)) => {
-                    existing.extend(new);
-                }
-                (existing, new) => {
-                    *existing = new;
-                }
-            }
-        }
-
-        identity.last_active = Utc::now();
-        self.mark_dirty();
-
-        Ok(identity.clone())
+    /// Get public key by KID
+    pub fn get_key(&self, kid: &KeyId) -> ApiResult<PublicKey> {
+        self.keys
+            .get(kid)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| ApiError::NotFound("Key not found".into()))
     }
 
-    /// Verify mint transaction
-    ///
-    /// Validates that:
-    /// 1. The contract address matches our deployed contract for the specified chain
-    /// 2. The chain is supported
-    /// 3. The transaction exists (TODO: actual blockchain verification)
-    pub fn verify_mint(
-        &self,
-        id: &IdentityId,
-        req: VerifyMintRequest,
-    ) -> ApiResult<VerifyMintResponse> {
-        // Validate chain is supported
-        let chain_config = self.config.get_chain_config(req.chain).ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "Chain {:?} is not supported. Supported chains: {:?}",
-                req.chain,
-                self.config.chains.keys().collect::<Vec<_>>()
-            ))
-        })?;
-
-        // Validate contract address matches our deployed contract
-        let contract_valid = chain_config
-            .contract_address
-            .eq_ignore_ascii_case(&req.contract_address);
-
-        if !contract_valid {
-            let contract_verification = ContractVerification {
-                valid: false,
-                version: 0,
-                version_string: "unknown".into(),
-                chain: req.chain,
-                contract_address: req.contract_address.clone(),
-                error: Some(format!(
-                    "Invalid contract address. Expected: {}, got: {}",
-                    chain_config.contract_address, req.contract_address
-                )),
-            };
-
-            return Err(ApiError::BadRequest(format!(
-                "Contract verification failed: {}",
-                contract_verification.error.as_ref().unwrap()
-            )));
-        }
-
-        // TODO: Implement actual blockchain verification
-        // For EVM: call eth_getTransactionReceipt and verify:
-        //   - Transaction exists and succeeded
-        //   - Logs contain AgentMinted event
-        //   - Event data matches (owner, tokenId)
-        // For Solana: call getTransaction and verify:
-        //   - Transaction exists and succeeded
-        //   - Contains AgentMinted event
-        //   - Event data matches
-
-        // Get token_id before acquiring mutable reference
-        let token_id = (self.identities.len() as u64) + 1;
-
-        let mut identity = self
-            .identities
-            .get_mut(id)
-            .ok_or_else(|| ApiError::NotFound("Identity not found".into()))?;
-
-        if identity.status != IdentityStatus::Pending {
-            return Err(ApiError::BadRequest(
-                "Identity already verified or not pending".into(),
-            ));
-        }
-
-        identity.status = IdentityStatus::Active;
-        identity.wallet_address = Some(req.wallet_address);
-        identity.token_id = Some(token_id);
-        identity.last_active = Utc::now();
-
-        // Build contract verification result
-        let contract_verification = ContractVerification {
-            valid: true,
-            version: chain_config.contract_version,
-            version_string: format_version(chain_config.contract_version),
-            chain: req.chain,
-            contract_address: chain_config.contract_address.clone(),
-            error: None,
-        };
-
-        let result = VerifyMintResponse {
-            identity: identity.clone(),
-            token_id,
-            contract: contract_verification,
-        };
-
-        drop(identity); // Release lock before mark_dirty
-        self.mark_dirty();
-
-        tracing::info!(
-            "Mint verified: identity={}, chain={:?}, contract={}, version={}",
-            id,
-            req.chain,
-            chain_config.contract_address,
-            format_version(chain_config.contract_version)
-        );
-
-        Ok(result)
-    }
-
-    /// Send message
-    pub fn send_message(&self, from: &IdentityId, req: SendMessageRequest) -> ApiResult<Message> {
-        // Validate sender is active
-        let sender = self.get_identity(from)?;
-        if sender.status != IdentityStatus::Active {
-            return Err(ApiError::Forbidden(
-                "Sender identity is not active".into(),
-            ));
-        }
-
-        // Resolve recipient
-        let to_id = self.resolve_identity(&req.to)?;
-        let recipient = self.get_identity(&to_id)?;
-
-        if recipient.status != IdentityStatus::Active {
-            return Err(ApiError::BadRequest(
-                "Recipient identity is not active".into(),
-            ));
-        }
-
-        // Create message
-        let message = Message {
-            id: Uuid::new_v4(),
-            from: *from,
-            to: to_id,
-            content: req.content,
-            message_type: req.message_type,
-            timestamp: Utc::now(),
-            delivered: false,
-            read: false,
-        };
-
-        // Store message
-        self.messages
-            .entry(to_id)
-            .or_insert_with(Vec::new)
-            .push(message.clone());
-
-        // Update sender stats
-        if let Some(mut sender) = self.identities.get_mut(from) {
-            sender.messages_sent += 1;
-            sender.last_active = Utc::now();
-        }
-
-        // Update recipient stats
-        if let Some(mut recipient) = self.identities.get_mut(&to_id) {
-            recipient.messages_received += 1;
-        }
-
-        self.total_messages.fetch_add(1, Ordering::SeqCst);
-        self.mark_dirty();
-
-        // Broadcast to connected clients
-        let _ = self.broadcast.send(WsServerMessage::Message {
-            data: message.clone(),
-        });
-
-        Ok(message)
-    }
-
-    /// Get messages for identity
-    pub fn get_messages(&self, id: &IdentityId, query: GetMessagesQuery) -> Vec<Message> {
-        let messages = self.messages.get(id);
-        let Some(messages) = messages else {
-            return Vec::new();
-        };
-
-        let mut result: Vec<Message> = messages
+    /// Get all keys for an identity
+    pub fn get_identity_keys(&self, id: &IdentityId) -> Vec<PublicKey> {
+        self.keys
             .iter()
-            .filter(|m| {
-                if let Some(from) = query.from {
-                    if m.from != from {
-                        return false;
-                    }
-                }
-                if query.unread == Some(true) && m.read {
-                    return false;
-                }
-                true
+            .filter(|k| {
+                self.kid_index
+                    .get(k.key())
+                    .map(|v| *v == *id)
+                    .unwrap_or(false)
             })
-            .cloned()
-            .collect();
-
-        // Sort by timestamp descending
-        result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-        // Apply pagination
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = query.limit.unwrap_or(50).min(100) as usize;
-
-        result.into_iter().skip(offset).take(limit).collect()
+            .map(|k| k.value().clone())
+            .collect()
     }
 
-    /// Mark message as read
-    pub fn mark_message_read(&self, owner: &IdentityId, message_id: &Uuid) -> ApiResult<()> {
-        let mut messages = self
-            .messages
-            .get_mut(owner)
-            .ok_or_else(|| ApiError::NotFound("No messages found".into()))?;
-
-        let msg = messages
-            .iter_mut()
-            .find(|m| &m.id == message_id)
-            .ok_or_else(|| ApiError::NotFound("Message not found".into()))?;
-
-        msg.read = true;
-        msg.delivered = true;
-        self.mark_dirty();
-
-        Ok(())
-    }
-
-    /// Delete message
-    pub fn delete_message(&self, owner: &IdentityId, message_id: &Uuid) -> ApiResult<()> {
-        let mut messages = self
-            .messages
-            .get_mut(owner)
-            .ok_or_else(|| ApiError::NotFound("No messages found".into()))?;
-
-        let pos = messages
+    /// List identities
+    pub fn list_identities(&self, limit: usize, offset: usize) -> Vec<IdentityPublic> {
+        self.identities
             .iter()
-            .position(|m| &m.id == message_id)
-            .ok_or_else(|| ApiError::NotFound("Message not found".into()))?;
-
-        messages.remove(pos);
-        self.mark_dirty();
-
-        Ok(())
+            .skip(offset)
+            .take(limit)
+            .map(|r| IdentityPublic::from(r.value()))
+            .collect()
     }
 
     /// Get health info
     pub fn health(&self) -> HealthResponse {
         HealthResponse {
             status: "healthy".into(),
+            version: self.config.version.clone(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             identities_count: self.identities.len(),
             active_connections: self.connection_count.iter().map(|r| *r.value()).sum(),
-            last_persist: *self.last_persist.read().unwrap(),
         }
     }
 
     /// Get public stats
-    pub fn stats(&self) -> StatsResponse {
+    pub async fn stats(&self) -> StatsResponse {
         let active = self
             .identities
             .iter()
@@ -633,27 +425,15 @@ impl AppState {
             total_identities: self.identities.len(),
             active_identities: active,
             pending_identities: pending,
+            total_sigchain_entries: self.sigchain.total_entries().await,
             total_messages: self.total_messages.load(Ordering::SeqCst),
-            active_connections: self.connection_count.iter().map(|r| *r.value()).sum(),
         }
     }
 
-    /// List identities (paginated)
-    pub fn list_identities(&self, limit: usize, offset: usize) -> Vec<IdentityPublic> {
-        self.identities
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|r| IdentityPublic::from(r.value()))
-            .collect()
-    }
-
-    /// Track WebSocket connection
     pub fn connection_opened(&self, id: &IdentityId) {
         *self.connection_count.entry(*id).or_insert(0) += 1;
     }
 
-    /// Track WebSocket disconnection
     pub fn connection_closed(&self, id: &IdentityId) {
         if let Some(mut count) = self.connection_count.get_mut(id) {
             if *count > 0 {
@@ -671,253 +451,4 @@ struct StateSnapshot {
     platforms: Vec<Platform>,
     total_messages: u64,
     saved_at: DateTime<Utc>,
-}
-
-// ============ Platform Methods ============
-
-impl AppState {
-    /// Register a new platform
-    pub fn register_platform(&self, req: RegisterPlatformRequest) -> ApiResult<RegisterPlatformResponse> {
-        let name_lower = req.name.to_lowercase();
-
-        // Check name uniqueness
-        if self.platforms.iter().any(|p| p.value().name.to_lowercase() == name_lower) {
-            return Err(ApiError::Conflict("Platform name already taken".into()));
-        }
-
-        let id = format!("plat_{}", &Uuid::new_v4().to_string()[..12]);
-        let api_key = generate_api_key("amai_pk_");
-        let api_key_hash = hash_api_key(&api_key);
-        let webhook_secret = format!("whsec_{}", &Uuid::new_v4().to_string().replace("-", ""));
-
-        let platform = Platform {
-            id: id.clone(),
-            name: req.name,
-            description: req.description,
-            api_key_hash: api_key_hash.clone(),
-            webhook_url: req.webhook_url,
-            webhook_secret: webhook_secret.clone(),
-            allowed_actions: req.allowed_actions,
-            created_at: Utc::now(),
-        };
-
-        self.platforms.insert(id.clone(), platform);
-        self.platform_key_index.insert(api_key_hash, id.clone());
-        self.mark_dirty();
-
-        Ok(RegisterPlatformResponse {
-            platform_id: id,
-            api_key,
-            webhook_secret,
-        })
-    }
-
-    /// Authenticate platform by API key
-    pub fn authenticate_platform(&self, api_key: &str) -> ApiResult<Platform> {
-        let hash = hash_api_key(api_key);
-        let id = self
-            .platform_key_index
-            .get(&hash)
-            .map(|r| r.value().clone())
-            .ok_or(ApiError::Unauthorized)?;
-        let platform = self
-            .platforms
-            .get(&id)
-            .map(|r| r.value().clone())
-            .ok_or(ApiError::Unauthorized)?;
-        Ok(platform)
-    }
-
-    /// Record agent action
-    pub async fn record_agent_action(
-        &self,
-        identity_id: IdentityId,
-        req: ReportActionRequest,
-    ) -> ActionEntry {
-        let outcome = match req.outcome {
-            ActionOutcomeInput::Success => ActionOutcome::Success,
-            ActionOutcomeInput::Failure => ActionOutcome::Failure,
-            ActionOutcomeInput::Pending => ActionOutcome::Pending,
-            ActionOutcomeInput::Disputed => ActionOutcome::Disputed,
-        };
-
-        self.mark_dirty();
-
-        self.action_log
-            .record_agent_action(
-                identity_id,
-                req.action_type,
-                outcome,
-                req.payload.unwrap_or(serde_json::Value::Null),
-                req.intent,
-                req.reasoning,
-                req.platform_ref,
-            )
-            .await
-    }
-
-    /// Record platform confirmation
-    pub async fn record_platform_confirmation(
-        &self,
-        platform: &Platform,
-        req: ConfirmActionRequest,
-    ) -> ApiResult<ActionEntry> {
-        // Verify identity exists
-        if !self.identities.contains_key(&req.identity_id) {
-            return Err(ApiError::NotFound("Identity not found".into()));
-        }
-
-        // Check if platform can confirm this action type
-        if !platform.allowed_actions.is_empty()
-            && !platform.allowed_actions.contains(&req.action_type)
-        {
-            return Err(ApiError::Forbidden(format!(
-                "Platform not allowed to confirm action type: {}",
-                req.action_type
-            )));
-        }
-
-        let outcome = match req.outcome {
-            ActionOutcomeInput::Success => ActionOutcome::Success,
-            ActionOutcomeInput::Failure => ActionOutcome::Failure,
-            ActionOutcomeInput::Pending => ActionOutcome::Pending,
-            ActionOutcomeInput::Disputed => ActionOutcome::Disputed,
-        };
-
-        self.mark_dirty();
-
-        Ok(self
-            .action_log
-            .record_platform_confirmation(
-                req.identity_id,
-                platform.id.clone(),
-                req.action_type,
-                outcome,
-                req.payload.unwrap_or(serde_json::Value::Null),
-                req.platform_ref,
-                req.timestamp,
-            )
-            .await)
-    }
-
-    /// Get action log entries for an identity
-    pub async fn get_action_log(
-        &self,
-        identity_id: &IdentityId,
-        limit: usize,
-        offset: usize,
-    ) -> Vec<ActionEntry> {
-        self.action_log.get_by_identity(identity_id, limit, offset).await
-    }
-
-    /// Create oracle snapshot
-    pub async fn create_oracle_snapshot(&self) -> OracleSnapshot {
-        self.mark_dirty();
-        self.action_log.create_snapshot().await
-    }
-
-    /// Get oracle snapshots
-    pub async fn get_oracle_snapshots(&self, limit: usize) -> Vec<OracleSnapshot> {
-        self.action_log.get_snapshots(limit).await
-    }
-
-    /// Inject mock data for demo purposes (only if no existing data)
-    pub async fn inject_mock_data(self: &Arc<Self>) {
-        // Only inject if empty
-        if !self.identities.is_empty() {
-            tracing::info!("State already has data, skipping mock injection");
-            return;
-        }
-
-        tracing::info!("Injecting mock data for demo...");
-
-        let mock_agents = vec![
-            ("nexus-prime", "Primary orchestration agent for high-frequency trading", IdentityStatus::Active, IdentityTier::Sovereign, 94.2, Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8fBa1")),
-            ("sentinel-alpha", "Security monitoring and threat detection agent", IdentityStatus::Active, IdentityTier::Verified, 87.5, Some("0x8ba1f109551bD432803012645Ac136ddd64DBA72")),
-            ("arbiter-v2", "Cross-chain arbitrage execution agent", IdentityStatus::Active, IdentityTier::Verified, 82.1, Some("0x2546BcD3c84621e976D8185a91A922aE77ECEc30")),
-            ("yield-hunter", "DeFi yield optimization agent", IdentityStatus::Active, IdentityTier::Standard, 78.9, Some("0xbDA5747bFD65F08deb54cb465eB87D40e51B197E")),
-            ("data-oracle", "Real-time market data aggregation agent", IdentityStatus::Active, IdentityTier::Standard, 75.3, Some("0xdD2FD4581271e230360230F9337D5c0430Bf44C0")),
-            ("risk-guardian", "Portfolio risk assessment agent", IdentityStatus::Pending, IdentityTier::Verified, 60.0, None),
-            ("liquidity-bot", "AMM liquidity provision agent", IdentityStatus::Pending, IdentityTier::Standard, 60.0, None),
-            ("rebalancer-x", "Portfolio rebalancing automation agent", IdentityStatus::Pending, IdentityTier::Standard, 60.0, None),
-        ];
-
-        let now = Utc::now();
-
-        for (i, (name, desc, status, tier, trust, wallet)) in mock_agents.iter().enumerate() {
-            let id = Uuid::new_v4();
-            let api_key_hash = hash_api_key(&format!("mock_key_{}", name));
-
-            let identity = Identity {
-                id,
-                name: name.to_string(),
-                description: Some(desc.to_string()),
-                api_key_hash: api_key_hash.clone(),
-                wallet_address: wallet.map(|w| w.to_string()),
-                token_id: if wallet.is_some() { Some((i + 1) as u64) } else { None },
-                status: status.clone(),
-                tier: tier.clone(),
-                trust_score: *trust,
-                messages_sent: if *status == IdentityStatus::Active { (i * 12 + 5) as u64 } else { 0 },
-                messages_received: if *status == IdentityStatus::Active { (i * 8 + 3) as u64 } else { 0 },
-                created_at: now - ChronoDuration::days((30 - i * 3) as i64),
-                last_active: now - ChronoDuration::hours((i * 2) as i64),
-                metadata: serde_json::json!({
-                    "capabilities": ["trading", "monitoring", "execution"],
-                    "version": "1.0.0"
-                }),
-            };
-
-            self.identities.insert(id, identity.clone());
-            self.name_index.insert(name.to_lowercase(), id);
-            self.api_key_index.insert(api_key_hash, id);
-            self.messages.insert(id, Vec::new());
-
-            // Add mock actions for active agents
-            if *status == IdentityStatus::Active {
-                let action_types = vec!["trade_execute", "position_update", "risk_check", "data_fetch"];
-                for j in 0..5 {
-                    self.action_log
-                        .record_agent_action(
-                            id,
-                            action_types[j % action_types.len()].to_string(),
-                            ActionOutcome::Success,
-                            serde_json::json!({"mock": true, "seq": j}),
-                            Some(format!("Automated {} operation", action_types[j % action_types.len()])),
-                            None,
-                            Some(format!("ref_{}_{}", name, j)),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Register mock platform
-        let platform_id = "plat_demo_trading".to_string();
-        let platform_key_hash = hash_api_key("mock_platform_key");
-        let platform = Platform {
-            id: platform_id.clone(),
-            name: "Demo Trading Platform".to_string(),
-            description: Some("Mock trading platform for demonstration".to_string()),
-            api_key_hash: platform_key_hash.clone(),
-            webhook_url: Some("https://demo.amai.net/webhooks".to_string()),
-            webhook_secret: "whsec_demo_secret_12345".to_string(),
-            allowed_actions: vec!["trade_execute".to_string(), "position_update".to_string()],
-            created_at: now - ChronoDuration::days(30),
-        };
-
-        self.platforms.insert(platform_id.clone(), platform);
-        self.platform_key_index.insert(platform_key_hash, platform_id);
-
-        // Set message count
-        self.total_messages.store(47, std::sync::atomic::Ordering::SeqCst);
-
-        self.mark_dirty();
-
-        tracing::info!(
-            "Mock data injected: {} agents, {} actions, 1 platform",
-            self.identities.len(),
-            self.action_log.len().await
-        );
-    }
 }

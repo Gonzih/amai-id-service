@@ -3,7 +3,7 @@ name = "id-service"
 version = "0.1.0"
 edition = "2021"
 authors = ["AMAI Labs"]
-description = "AMAI Identity Service - Agent registration and messaging"
+description = "AMAI Identity Service - GPG/Ed25519 cryptographic identity for autonomous agents"
 
 [dependencies]
 # Async runtime
@@ -27,6 +27,15 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Cryptography - Ed25519
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Cryptography - RSA
+rsa = { version = "0.9", features = ["sha2"] }
+
+# Base64 encoding
+base64 = "0.22"
+
 # Hashing
 sha2 = "0.10"
 hex = "0.4"
@@ -46,16 +55,12 @@ anyhow = "1"
 futures = "0.3"
 axum-extra = { version = "0.9", features = ["typed-header"] }
 
-# HTTP client for RPC
-reqwest = { version = "0.12", features = ["json"] }
-
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
-wiremock = "0.6"
 serial_test = "3"
 once_cell = "1"
+reqwest = { version = "0.12", features = ["json"] }
 
 [[test]]
 name = "integration"
