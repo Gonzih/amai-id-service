@@ -128,6 +128,115 @@ Agent <-- Mock LLM Service (REPLAY mode)
 
 ---
 
+## 4. Jail System (Contained Agent Execution)
+
+Isolated container environments for reproducible agent testing. Works with Mock LLM Service to create fully deterministic agent runs.
+
+**Problem:**
+- Agents modify filesystems, make network calls, have side effects
+- Can't safely test untrusted agents
+- Can't measure exactly what an agent did
+- No isolation between test runs
+
+**Solution:**
+- Containerized execution environment ("jail")
+- Pre-configured with Mock LLM endpoint
+- Filesystem snapshots before/after execution
+- Network isolation (only Mock LLM allowed)
+- Resource limits (CPU, memory, time)
+
+**Architecture:**
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    Jail System                       │
+│  ┌───────────────────────────────────────────────┐  │
+│  │              Container (Jail)                  │  │
+│  │  ┌─────────┐    ┌─────────────────────────┐   │  │
+│  │  │  Agent  │───▶│  Mock LLM (sidecar)     │   │  │
+│  │  └─────────┘    └─────────────────────────┘   │  │
+│  │       │                                        │  │
+│  │       ▼                                        │  │
+│  │  ┌─────────────────────────────────────────┐  │  │
+│  │  │         Isolated Filesystem              │  │  │
+│  │  │  (copy-on-write, snapshotted)           │  │  │
+│  │  └─────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────┘  │
+│                         │                            │
+│                         ▼                            │
+│  ┌───────────────────────────────────────────────┐  │
+│  │              Diff / Analysis                   │  │
+│  │  - Filesystem changes                         │  │
+│  │  - Network calls logged                       │  │
+│  │  - Resource usage                             │  │
+│  │  - Exit code / output                         │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+**Features:**
+
+1. **Container Management**
+   - Spawn isolated containers for agent runs
+   - Pre-built base images with common tools
+   - Inject agent code/config at runtime
+   - Automatic cleanup after execution
+
+2. **Filesystem Isolation**
+   - Copy-on-write filesystem (overlay)
+   - Snapshot before agent runs
+   - Diff after agent completes
+   - Extract exactly what files were created/modified/deleted
+
+3. **Network Isolation**
+   - Block all external network by default
+   - Only allow Mock LLM Service endpoint
+   - Log all attempted network calls
+   - Optional: allowlist specific endpoints
+
+4. **Resource Limits**
+   - CPU quota
+   - Memory limit
+   - Execution timeout
+   - Disk space quota
+
+5. **Reproducibility**
+   - Same container image + Mock LLM replay = identical run
+   - Deterministic agent behavior verification
+   - Regression testing for agent updates
+
+**Integration with Mock LLM:**
+- Jail spawns with Mock LLM sidecar
+- LLM_API_BASE points to sidecar
+- Sidecar connects to central Mock LLM Service
+- Recording session tied to jail execution
+
+**Use Cases:**
+- Trust score validation (run agent, measure impact)
+- Skill certification (prove agent does what it claims)
+- Security auditing (what does this agent actually do?)
+- Debugging (reproduce exact failure conditions)
+- A/B testing agent versions
+
+**API:**
+- `POST /jails` - Create new jail with config
+- `POST /jails/:id/run` - Execute agent in jail
+- `GET /jails/:id/status` - Check execution status
+- `GET /jails/:id/diff` - Get filesystem diff
+- `GET /jails/:id/logs` - Get execution logs
+- `GET /jails/:id/network` - Get network call log
+- `DELETE /jails/:id` - Cleanup jail
+
+**Output Artifacts:**
+- Filesystem diff (tar of changes)
+- Execution logs (stdout/stderr)
+- Network log (attempted calls)
+- Resource usage metrics
+- Exit code and duration
+- Mock LLM recording session ID
+
+---
+
 ## Service Dependencies
 
 ```
@@ -139,14 +248,16 @@ Agent <-- Mock LLM Service (REPLAY mode)
                            │ writes trust deltas
                            ▼
 ┌─────────────┐     ┌─────────────┐
-│  Mock LLM   │     │ ID Service  │
-│  Service    │     │ (Identity)  │
-└─────────────┘     └─────────────┘
+│ Jail System │────▶│ ID Service  │
+│ (Container) │     │ (Identity)  │
+└──────┬──────┘     └─────────────┘
        │                   ▲
-       │                   │
-       └───────────────────┘
-         agents register here
-         mock service validates agent identity
+       │ spawns with       │
+       ▼                   │
+┌─────────────┐            │
+│  Mock LLM   │────────────┘
+│  Service    │  validates agent identity
+└─────────────┘
 ```
 
 ---
@@ -157,4 +268,6 @@ Agent <-- Mock LLM Service (REPLAY mode)
 2. [ ] L Service - Trust score adjustment API
 3. [ ] Mock LLM Service - Basic proxy with recording
 4. [ ] Mock LLM Service - Replay mode
-5. [ ] Mock LLM Service - Container filesystem diffing
+5. [ ] Jail System - Container orchestration
+6. [ ] Jail System - Filesystem diffing
+7. [ ] Jail System + Mock LLM integration
