@@ -70,8 +70,8 @@ async fn get_identity_keys(
         identity_id: id,
         name: identity.name,
         keys: keys.iter().map(PublicKeyInfo::from).collect(),
-        sigchain_hash: identity.sigchain_hash,
-        sigchain_seq: identity.sigchain_seq,
+        soulchain_hash: identity.soulchain_hash,
+        soulchain_seq: identity.soulchain_seq,
     })))
 }
 
@@ -137,7 +137,7 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         <div class="stats">
             <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Agents</div></div>
             <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Active</div></div>
-            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Sigchain Entries</div></div>
+            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Soulchain Entries</div></div>
             <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Uptime</div></div>
         </div>
         <div class="links">
@@ -150,7 +150,7 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     </div>
 </body>
 </html>"##,
-        stats.total_identities, stats.active_identities, stats.total_sigchain_entries, uptime_str,
+        stats.total_identities, stats.active_identities, stats.total_soulchain_entries, uptime_str,
     );
 
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)

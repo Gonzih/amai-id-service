@@ -17,7 +17,7 @@ use crate::auth::{
 };
 use crate::config::Config;
 use crate::error::{ApiError, ApiResult};
-use crate::sigchain::{eldest_body, SigchainStore};
+use crate::soulchain::{eldest_body, SoulchainStore};
 use crate::types::*;
 
 /// Global application state
@@ -38,8 +38,8 @@ pub struct AppState {
     pub connection_count: DashMap<IdentityId, usize>,
     /// Total messages sent
     pub total_messages: AtomicU64,
-    /// Sigchain storage
-    pub sigchain: SigchainStore,
+    /// Soulchain storage
+    pub soulchain: SoulchainStore,
     /// Registered platforms
     pub platforms: DashMap<String, Platform>,
     /// Platform KID -> platform ID lookup
@@ -63,7 +63,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Arc<Self> {
         let (tx, _) = broadcast::channel(1024);
-        let sigchain_dir = config.sigchain_dir();
+        let soulchain_dir = config.soulchain_dir();
 
         Arc::new(Self {
             identities: DashMap::new(),
@@ -74,7 +74,7 @@ impl AppState {
             broadcast: tx,
             connection_count: DashMap::new(),
             total_messages: AtomicU64::new(0),
-            sigchain: SigchainStore::new(sigchain_dir),
+            soulchain: SoulchainStore::new(soulchain_dir),
             platforms: DashMap::new(),
             platform_kid_index: DashMap::new(),
             nonces: NonceStore::new(config.nonce_expiry),
@@ -127,10 +127,10 @@ impl AppState {
             tracing::info!("No existing state file, starting fresh");
         }
 
-        // Load sigchains
-        match self.sigchain.load_all().await {
-            Ok(count) => tracing::info!("Loaded {} sigchains", count),
-            Err(e) => tracing::warn!("Failed to load sigchains: {}", e),
+        // Load soulchains
+        match self.soulchain.load_all().await {
+            Ok(count) => tracing::info!("Loaded {} soulchains", count),
+            Err(e) => tracing::warn!("Failed to load soulchains: {}", e),
         }
 
         Ok(())
@@ -187,7 +187,7 @@ impl AppState {
     /// Save all state
     pub async fn save_all(&self) -> anyhow::Result<()> {
         self.save_to_disk().await?;
-        self.sigchain.save_all().await?;
+        self.soulchain.save_all().await?;
         Ok(())
     }
 
@@ -289,11 +289,11 @@ impl AppState {
             last_active: now,
             metadata: req.metadata.unwrap_or(serde_json::Value::Null),
             keys: vec![],
-            sigchain_hash: None,
-            sigchain_seq: 0,
+            soulchain_hash: None,
+            soulchain_seq: 0,
         };
 
-        // Create eldest sigchain link
+        // Create eldest soulchain link
         let eldest = eldest_body(
             public_key.kid.clone(),
             public_key.key_type.clone(),
@@ -301,13 +301,13 @@ impl AppState {
         );
 
         let link = self
-            .sigchain
+            .soulchain
             .append(&id, eldest, req.signature.clone(), &public_key)
             .await?;
 
         let mut identity = identity;
-        identity.sigchain_hash = Some(link.curr.clone());
-        identity.sigchain_seq = link.seqno;
+        identity.soulchain_hash = Some(link.curr.clone());
+        identity.soulchain_seq = link.seqno;
 
         self.identities.insert(id, identity.clone());
         self.name_index.insert(name_lower, id);
@@ -425,7 +425,7 @@ impl AppState {
             total_identities: self.identities.len(),
             active_identities: active,
             pending_identities: pending,
-            total_sigchain_entries: self.sigchain.total_entries().await,
+            total_soulchain_entries: self.soulchain.total_entries().await,
             total_messages: self.total_messages.load(Ordering::SeqCst),
         }
     }

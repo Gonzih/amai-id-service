@@ -1,6 +1,6 @@
-//! Sigchain implementation (Keybase-style cryptographic chain)
+//! Soulchain implementation (Keybase-style cryptographic chain)
 //!
-//! Each identity has a sigchain - an append-only list of cryptographically
+//! Each identity has a soulchain - an append-only list of cryptographically
 //! linked entries. Every entry is signed by the identity's key and includes
 //! the hash of the previous entry, creating an immutable audit log.
 
@@ -13,18 +13,18 @@ use tokio::sync::RwLock;
 use crate::crypto::{parse_public_key, sha256_hex, verify_signature};
 use crate::error::{ApiError, ApiResult};
 use crate::types::{
-    ActionOutcome, IdentityId, KeyId, KeyType, PublicKey, SigchainBody, SigchainLink,
+    ActionOutcome, IdentityId, KeyId, KeyType, PublicKey, SoulchainBody, SoulchainLink,
 };
 
-/// Sigchain storage for all identities
-pub struct SigchainStore {
-    /// Sigchains indexed by identity ID
-    chains: RwLock<HashMap<IdentityId, Vec<SigchainLink>>>,
+/// Soulchain storage for all identities
+pub struct SoulchainStore {
+    /// Soulchains indexed by identity ID
+    chains: RwLock<HashMap<IdentityId, Vec<SoulchainLink>>>,
     /// Storage directory
     storage_dir: PathBuf,
 }
 
-impl SigchainStore {
+impl SoulchainStore {
     pub fn new(storage_dir: PathBuf) -> Self {
         Self {
             chains: RwLock::new(HashMap::new()),
@@ -32,7 +32,7 @@ impl SigchainStore {
         }
     }
 
-    /// Get current sigchain length for an identity
+    /// Get current soulchain length for an identity
     pub async fn get_seqno(&self, identity_id: &IdentityId) -> u64 {
         let chains = self.chains.read().await;
         chains.get(identity_id).map(|c| c.len() as u64).unwrap_or(0)
@@ -47,13 +47,13 @@ impl SigchainStore {
             .map(|link| link.curr.clone())
     }
 
-    /// Get sigchain links for an identity
+    /// Get soulchain links for an identity
     pub async fn get_links(
         &self,
         identity_id: &IdentityId,
         limit: usize,
         offset: usize,
-    ) -> Vec<SigchainLink> {
+    ) -> Vec<SoulchainLink> {
         let chains = self.chains.read().await;
         chains
             .get(identity_id)
@@ -74,16 +74,16 @@ impl SigchainStore {
         chains.values().map(|c| c.len() as u64).sum()
     }
 
-    /// Append a new link to the sigchain
+    /// Append a new link to the soulchain
     ///
     /// This verifies the signature and hash chain before appending.
     pub async fn append(
         &self,
         identity_id: &IdentityId,
-        body: SigchainBody,
+        body: SoulchainBody,
         signature: String,
         signing_key: &PublicKey,
-    ) -> ApiResult<SigchainLink> {
+    ) -> ApiResult<SoulchainLink> {
         let mut chains = self.chains.write().await;
         let chain = chains.entry(*identity_id).or_insert_with(Vec::new);
 
@@ -95,8 +95,8 @@ impl SigchainStore {
         };
 
         // First link must be Eldest
-        if seqno == 1 && !matches!(body, SigchainBody::Eldest { .. }) {
-            return Err(ApiError::sigchain("First sigchain link must be 'eldest'"));
+        if seqno == 1 && !matches!(body, SoulchainBody::Eldest { .. }) {
+            return Err(ApiError::soulchain("First soulchain link must be 'eldest'"));
         }
 
         // Create the link body JSON for hashing
@@ -111,9 +111,9 @@ impl SigchainStore {
             .map_err(|e| ApiError::signature(e.to_string()))?;
 
         verify_signature(&parsed_key, body_json.as_bytes(), &signature)
-            .map_err(|e| ApiError::signature(format!("Sigchain signature invalid: {}", e)))?;
+            .map_err(|e| ApiError::signature(format!("Soulchain signature invalid: {}", e)))?;
 
-        let link = SigchainLink {
+        let link = SoulchainLink {
             seqno,
             prev,
             curr,
@@ -128,7 +128,7 @@ impl SigchainStore {
         Ok(link)
     }
 
-    /// Verify entire sigchain integrity
+    /// Verify entire soulchain integrity
     pub async fn verify_chain(
         &self,
         identity_id: &IdentityId,
@@ -137,14 +137,14 @@ impl SigchainStore {
         let chains = self.chains.read().await;
         let chain = chains
             .get(identity_id)
-            .ok_or_else(|| ApiError::not_found("Sigchain not found"))?;
+            .ok_or_else(|| ApiError::not_found("Soulchain not found"))?;
 
         let mut expected_prev: Option<String> = None;
 
         for (i, link) in chain.iter().enumerate() {
             // Check seqno
             if link.seqno != (i + 1) as u64 {
-                return Err(ApiError::sigchain(format!(
+                return Err(ApiError::soulchain(format!(
                     "Seqno mismatch at index {}: expected {}, got {}",
                     i,
                     i + 1,
@@ -154,7 +154,7 @@ impl SigchainStore {
 
             // Check prev hash
             if link.prev != expected_prev {
-                return Err(ApiError::sigchain(format!(
+                return Err(ApiError::soulchain(format!(
                     "Hash chain broken at seqno {}",
                     link.seqno
                 )));
@@ -165,7 +165,7 @@ impl SigchainStore {
                 serde_json::to_string(&link.body).map_err(|e| ApiError::internal(e.to_string()))?;
             let computed_hash = sha256_hex(body_json.as_bytes());
             if computed_hash != link.curr {
-                return Err(ApiError::sigchain(format!(
+                return Err(ApiError::soulchain(format!(
                     "Body hash mismatch at seqno {}",
                     link.seqno
                 )));
@@ -176,7 +176,7 @@ impl SigchainStore {
                 .iter()
                 .find(|k| k.kid == link.signing_kid)
                 .ok_or_else(|| {
-                    ApiError::sigchain(format!(
+                    ApiError::soulchain(format!(
                         "Signing key {} not found for seqno {}",
                         link.signing_kid, link.seqno
                     ))
@@ -184,10 +184,10 @@ impl SigchainStore {
 
             // Verify signature
             let parsed_key = parse_public_key(&signing_key.public_key_pem, &signing_key.key_type)
-                .map_err(|e| ApiError::sigchain(e.to_string()))?;
+                .map_err(|e| ApiError::soulchain(e.to_string()))?;
 
             verify_signature(&parsed_key, body_json.as_bytes(), &link.sig).map_err(|e| {
-                ApiError::sigchain(format!(
+                ApiError::soulchain(format!(
                     "Signature verification failed at seqno {}: {}",
                     link.seqno, e
                 ))
@@ -199,7 +199,7 @@ impl SigchainStore {
         Ok(())
     }
 
-    /// Save sigchain to disk
+    /// Save soulchain to disk
     pub async fn save(&self, identity_id: &IdentityId) -> anyhow::Result<()> {
         let chains = self.chains.read().await;
         if let Some(chain) = chains.get(identity_id) {
@@ -211,19 +211,19 @@ impl SigchainStore {
         Ok(())
     }
 
-    /// Load sigchain from disk
+    /// Load soulchain from disk
     pub async fn load(&self, identity_id: &IdentityId) -> anyhow::Result<()> {
         let path = self.storage_dir.join(format!("{}.json", identity_id));
         if path.exists() {
             let json = tokio::fs::read_to_string(&path).await?;
-            let chain: Vec<SigchainLink> = serde_json::from_str(&json)?;
+            let chain: Vec<SoulchainLink> = serde_json::from_str(&json)?;
             let mut chains = self.chains.write().await;
             chains.insert(*identity_id, chain);
         }
         Ok(())
     }
 
-    /// Load all sigchains from disk
+    /// Load all soulchains from disk
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         if !self.storage_dir.exists() {
             return Ok(0);
@@ -238,7 +238,7 @@ impl SigchainStore {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Ok(id) = stem.parse::<IdentityId>() {
                         let json = tokio::fs::read_to_string(&path).await?;
-                        if let Ok(chain) = serde_json::from_str::<Vec<SigchainLink>>(&json) {
+                        if let Ok(chain) = serde_json::from_str::<Vec<SoulchainLink>>(&json) {
                             let mut chains = self.chains.write().await;
                             chains.insert(id, chain);
                             count += 1;
@@ -251,7 +251,7 @@ impl SigchainStore {
         Ok(count)
     }
 
-    /// Save all sigchains
+    /// Save all soulchains
     pub async fn save_all(&self) -> anyhow::Result<()> {
         let chains = self.chains.read().await;
         tokio::fs::create_dir_all(&self.storage_dir).await?;
@@ -266,15 +266,15 @@ impl SigchainStore {
     }
 }
 
-/// Helper to create sigchain body for action
+/// Helper to create soulchain body for action
 pub fn action_body(
     action_type: String,
     outcome: ActionOutcome,
     payload: serde_json::Value,
     intent: Option<String>,
     platform_ref: Option<String>,
-) -> SigchainBody {
-    SigchainBody::Action {
+) -> SoulchainBody {
+    SoulchainBody::Action {
         action_type,
         outcome,
         payload,
@@ -284,8 +284,8 @@ pub fn action_body(
 }
 
 /// Helper to create eldest (first key registration) body
-pub fn eldest_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> SigchainBody {
-    SigchainBody::Eldest {
+pub fn eldest_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> SoulchainBody {
+    SoulchainBody::Eldest {
         kid,
         key_type,
         public_key_pem,
@@ -293,8 +293,8 @@ pub fn eldest_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> Sig
 }
 
 /// Helper to create add key body
-pub fn add_key_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> SigchainBody {
-    SigchainBody::AddKey {
+pub fn add_key_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> SoulchainBody {
+    SoulchainBody::AddKey {
         kid,
         key_type,
         public_key_pem,
@@ -302,8 +302,8 @@ pub fn add_key_body(kid: KeyId, key_type: KeyType, public_key_pem: String) -> Si
 }
 
 /// Helper to create revoke key body
-pub fn revoke_key_body(kid: KeyId) -> SigchainBody {
-    SigchainBody::RevokeKey { kid }
+pub fn revoke_key_body(kid: KeyId) -> SoulchainBody {
+    SoulchainBody::RevokeKey { kid }
 }
 
 #[cfg(test)]
@@ -312,9 +312,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_sigchain_store_basic() {
+    async fn test_soulchain_store_basic() {
         let dir = tempdir().unwrap();
-        let store = SigchainStore::new(dir.path().to_path_buf());
+        let store = SoulchainStore::new(dir.path().to_path_buf());
 
         let id = IdentityId::new_v4();
 
@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn test_total_entries() {
         let dir = tempdir().unwrap();
-        let store = SigchainStore::new(dir.path().to_path_buf());
+        let store = SoulchainStore::new(dir.path().to_path_buf());
 
         assert_eq!(store.total_entries().await, 0);
     }

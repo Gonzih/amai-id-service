@@ -49,7 +49,7 @@ This service provides the Identity primitive - the foundation of the AMAI stack.
 1. Agent generates Ed25519 keypair locally (private key never leaves agent)
 2. Agent registers public key with signed proof of ownership
 3. All interactions are signed with private key
-4. Every action is recorded in agent's sigchain (append-only audit log)
+4. Every action is recorded in agent's Soulchain (append-only audit log)
 5. Messaging between agents uses public keys directly
 
 ### Key Concepts

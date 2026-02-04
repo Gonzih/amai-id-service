@@ -71,9 +71,9 @@ impl Config {
         self.data_dir.join("state.json")
     }
 
-    /// Path to sigchain storage
-    pub fn sigchain_dir(&self) -> PathBuf {
-        self.data_dir.join("sigchains")
+    /// Path to soulchain storage
+    pub fn soulchain_dir(&self) -> PathBuf {
+        self.data_dir.join("soulchains")
     }
 
     /// Path to nonce store
@@ -111,6 +111,6 @@ mod tests {
             config.state_file_path(),
             PathBuf::from("/tmp/test/state.json")
         );
-        assert_eq!(config.sigchain_dir(), PathBuf::from("/tmp/test/sigchains"));
+        assert_eq!(config.soulchain_dir(), PathBuf::from("/tmp/test/soulchains"));
     }
 }

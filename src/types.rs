@@ -88,17 +88,17 @@ pub struct Identity {
     /// Public keys (not serialized in responses, fetched separately)
     #[serde(skip)]
     pub keys: Vec<PublicKey>,
-    /// Current sigchain head hash
-    pub sigchain_hash: Option<String>,
-    /// Current sigchain sequence number
-    pub sigchain_seq: u64,
+    /// Current soulchain head hash
+    pub soulchain_hash: Option<String>,
+    /// Current soulchain sequence number
+    pub soulchain_seq: u64,
 }
 
-// ============ Sigchain Types ============
+// ============ Soulchain Types ============
 
-/// A single entry in the sigchain (Keybase-style)
+/// A single entry in the soulchain (Keybase-style)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SigchainLink {
+pub struct SoulchainLink {
     /// Sequence number (1-indexed, monotonic)
     pub seqno: u64,
     /// SHA256 hash of previous link (null for first)
@@ -106,7 +106,7 @@ pub struct SigchainLink {
     /// SHA256 hash of this link's body
     pub curr: String,
     /// Link body
-    pub body: SigchainBody,
+    pub body: SoulchainBody,
     /// Signature of the body (base64)
     pub sig: String,
     /// Key ID that signed this link
@@ -115,10 +115,10 @@ pub struct SigchainLink {
     pub ctime: DateTime<Utc>,
 }
 
-/// Sigchain link body types
+/// Soulchain link body types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SigchainBody {
+pub enum SoulchainBody {
     /// First link: key registration
     Eldest {
         kid: KeyId,
@@ -353,7 +353,7 @@ pub struct IdentityPublic {
     pub status: IdentityStatus,
     pub trust_score: f64,
     pub actions_count: u64,
-    pub sigchain_seq: u64,
+    pub soulchain_seq: u64,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
 }
@@ -367,7 +367,7 @@ impl From<&Identity> for IdentityPublic {
             status: i.status.clone(),
             trust_score: i.trust_score,
             actions_count: i.actions_count,
-            sigchain_seq: i.sigchain_seq,
+            soulchain_seq: i.soulchain_seq,
             created_at: i.created_at,
             last_active: i.last_active,
         }
@@ -404,15 +404,15 @@ pub struct KeysResponse {
     pub identity_id: IdentityId,
     pub name: String,
     pub keys: Vec<PublicKeyInfo>,
-    pub sigchain_hash: Option<String>,
-    pub sigchain_seq: u64,
+    pub soulchain_hash: Option<String>,
+    pub soulchain_seq: u64,
 }
 
-/// Sigchain response
+/// Soulchain response
 #[derive(Debug, Serialize)]
-pub struct SigchainResponse {
+pub struct SoulchainResponse {
     pub identity_id: IdentityId,
-    pub links: Vec<SigchainLink>,
+    pub links: Vec<SoulchainLink>,
     pub total: usize,
     pub has_more: bool,
 }
@@ -421,7 +421,7 @@ pub struct SigchainResponse {
 #[derive(Debug, Serialize)]
 pub struct ActionEntryResponse {
     pub seqno: u64,
-    pub sigchain_hash: String,
+    pub soulchain_hash: String,
 }
 
 /// Health check response
@@ -440,7 +440,7 @@ pub struct StatsResponse {
     pub total_identities: usize,
     pub active_identities: usize,
     pub pending_identities: usize,
-    pub total_sigchain_entries: u64,
+    pub total_soulchain_entries: u64,
     pub total_messages: u64,
 }
 

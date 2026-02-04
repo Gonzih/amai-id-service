@@ -37,8 +37,8 @@ pub enum ApiError {
     #[error("Timestamp expired or too far in future")]
     TimestampInvalid,
 
-    #[error("Sigchain error: {0}")]
-    SigchainError(String),
+    #[error("Soulchain error: {0}")]
+    SoulchainError(String),
 
     #[error("Rate limited")]
     RateLimited,
@@ -72,8 +72,8 @@ impl ApiError {
         Self::SignatureError(msg.into())
     }
 
-    pub fn sigchain(msg: impl Into<String>) -> Self {
-        Self::SigchainError(msg.into())
+    pub fn soulchain(msg: impl Into<String>) -> Self {
+        Self::SoulchainError(msg.into())
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -115,10 +115,10 @@ impl IntoResponse for ApiError {
                 "Timestamp invalid".to_string(),
                 Some("Ensure timestamp is within 5 minutes of server time"),
             ),
-            Self::SigchainError(msg) => (
+            Self::SoulchainError(msg) => (
                 StatusCode::BAD_REQUEST,
                 msg.clone(),
-                Some("Check sigchain integrity"),
+                Some("Check soulchain integrity"),
             ),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,

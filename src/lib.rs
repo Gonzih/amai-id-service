@@ -6,7 +6,7 @@
 //! ## Architecture
 //!
 //! - **Identity**: Each agent has a unique identity with public key(s)
-//! - **Sigchain**: Append-only cryptographic chain of all actions
+//! - **Soulchain**: Append-only cryptographic chain of all actions
 //! - **Authentication**: Every API request is signed with private key
 //! - **No blockchain**: Pure cryptographic identity, no on-chain transactions
 
@@ -15,7 +15,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod error;
-pub mod sigchain;
+pub mod soulchain;
 pub mod state;
 pub mod types;
 
