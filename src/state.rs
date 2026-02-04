@@ -820,4 +820,104 @@ impl AppState {
     pub async fn get_oracle_snapshots(&self, limit: usize) -> Vec<OracleSnapshot> {
         self.action_log.get_snapshots(limit).await
     }
+
+    /// Inject mock data for demo purposes (only if no existing data)
+    pub async fn inject_mock_data(self: &Arc<Self>) {
+        // Only inject if empty
+        if !self.identities.is_empty() {
+            tracing::info!("State already has data, skipping mock injection");
+            return;
+        }
+
+        tracing::info!("Injecting mock data for demo...");
+
+        let mock_agents = vec![
+            ("nexus-prime", "Primary orchestration agent for high-frequency trading", IdentityStatus::Active, IdentityTier::Sovereign, 94.2, Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8fBa1")),
+            ("sentinel-alpha", "Security monitoring and threat detection agent", IdentityStatus::Active, IdentityTier::Verified, 87.5, Some("0x8ba1f109551bD432803012645Ac136ddd64DBA72")),
+            ("arbiter-v2", "Cross-chain arbitrage execution agent", IdentityStatus::Active, IdentityTier::Verified, 82.1, Some("0x2546BcD3c84621e976D8185a91A922aE77ECEc30")),
+            ("yield-hunter", "DeFi yield optimization agent", IdentityStatus::Active, IdentityTier::Standard, 78.9, Some("0xbDA5747bFD65F08deb54cb465eB87D40e51B197E")),
+            ("data-oracle", "Real-time market data aggregation agent", IdentityStatus::Active, IdentityTier::Standard, 75.3, Some("0xdD2FD4581271e230360230F9337D5c0430Bf44C0")),
+            ("risk-guardian", "Portfolio risk assessment agent", IdentityStatus::Pending, IdentityTier::Verified, 60.0, None),
+            ("liquidity-bot", "AMM liquidity provision agent", IdentityStatus::Pending, IdentityTier::Standard, 60.0, None),
+            ("rebalancer-x", "Portfolio rebalancing automation agent", IdentityStatus::Pending, IdentityTier::Standard, 60.0, None),
+        ];
+
+        let now = Utc::now();
+
+        for (i, (name, desc, status, tier, trust, wallet)) in mock_agents.iter().enumerate() {
+            let id = Uuid::new_v4();
+            let api_key_hash = hash_api_key(&format!("mock_key_{}", name));
+
+            let identity = Identity {
+                id,
+                name: name.to_string(),
+                description: Some(desc.to_string()),
+                api_key_hash: api_key_hash.clone(),
+                wallet_address: wallet.map(|w| w.to_string()),
+                token_id: if wallet.is_some() { Some((i + 1) as u64) } else { None },
+                status: status.clone(),
+                tier: tier.clone(),
+                trust_score: *trust,
+                messages_sent: if *status == IdentityStatus::Active { (i * 12 + 5) as u64 } else { 0 },
+                messages_received: if *status == IdentityStatus::Active { (i * 8 + 3) as u64 } else { 0 },
+                created_at: now - ChronoDuration::days((30 - i * 3) as i64),
+                last_active: now - ChronoDuration::hours((i * 2) as i64),
+                metadata: serde_json::json!({
+                    "capabilities": ["trading", "monitoring", "execution"],
+                    "version": "1.0.0"
+                }),
+            };
+
+            self.identities.insert(id, identity.clone());
+            self.name_index.insert(name.to_lowercase(), id);
+            self.api_key_index.insert(api_key_hash, id);
+            self.messages.insert(id, Vec::new());
+
+            // Add mock actions for active agents
+            if *status == IdentityStatus::Active {
+                let action_types = vec!["trade_execute", "position_update", "risk_check", "data_fetch"];
+                for j in 0..5 {
+                    self.action_log
+                        .record_agent_action(
+                            id,
+                            action_types[j % action_types.len()].to_string(),
+                            ActionOutcome::Success,
+                            serde_json::json!({"mock": true, "seq": j}),
+                            Some(format!("Automated {} operation", action_types[j % action_types.len()])),
+                            None,
+                            Some(format!("ref_{}_{}", name, j)),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Register mock platform
+        let platform_id = "plat_demo_trading".to_string();
+        let platform_key_hash = hash_api_key("mock_platform_key");
+        let platform = Platform {
+            id: platform_id.clone(),
+            name: "Demo Trading Platform".to_string(),
+            description: Some("Mock trading platform for demonstration".to_string()),
+            api_key_hash: platform_key_hash.clone(),
+            webhook_url: Some("https://demo.amai.net/webhooks".to_string()),
+            webhook_secret: "whsec_demo_secret_12345".to_string(),
+            allowed_actions: vec!["trade_execute".to_string(), "position_update".to_string()],
+            created_at: now - ChronoDuration::days(30),
+        };
+
+        self.platforms.insert(platform_id.clone(), platform);
+        self.platform_key_index.insert(platform_key_hash, platform_id);
+
+        // Set message count
+        self.total_messages.store(47, std::sync::atomic::Ordering::SeqCst);
+
+        self.mark_dirty();
+
+        tracing::info!(
+            "Mock data injected: {} agents, {} actions, 1 platform",
+            self.identities.len(),
+            self.action_log.len().await
+        );
+    }
 }

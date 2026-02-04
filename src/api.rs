@@ -580,154 +580,566 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         format!("{}d {}h", uptime / 86400, (uptime % 86400) / 3600)
     };
 
-    let html = format!(r#"<!DOCTYPE html>
+    // Get recent agents for the activity feed
+    let recent_agents: Vec<_> = state.list_identities(8, 0);
+
+    let mut agents_html = String::new();
+    for agent in &recent_agents {
+        let status_class = match agent.status {
+            IdentityStatus::Active => "status-active",
+            IdentityStatus::Pending => "status-pending",
+            _ => "status-inactive",
+        };
+        let status_text = match agent.status {
+            IdentityStatus::Active => "VERIFIED",
+            IdentityStatus::Pending => "PENDING",
+            _ => "INACTIVE",
+        };
+        agents_html.push_str(&format!(
+            r#"<div class="agent-row">
+                <div class="agent-name">{}</div>
+                <div class="agent-trust">{:.0}</div>
+                <div class="agent-status {}"><span class="status-dot"></span>{}</div>
+            </div>"#,
+            agent.name, agent.trust_score, status_class, status_text
+        ));
+    }
+
+    if agents_html.is_empty() {
+        agents_html = r#"<div class="no-agents">No agents registered yet</div>"#.to_string();
+    }
+
+    let html = format!(r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AMAI Identity Service</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-            background: #0a0a0a;
-            color: #e0e0e0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #000;
+            color: #fff;
             min-height: 100vh;
-            padding: 2rem;
+            overflow-x: hidden;
         }}
-        .container {{ max-width: 800px; margin: 0 auto; }}
-        h1 {{
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
-            background: linear-gradient(90deg, #00ff88, #00ccff);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+
+        /* Perspective Grid Background */
+        .grid-bg {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background:
+                linear-gradient(180deg, transparent 0%, rgba(255,255,255,0.02) 50%, transparent 100%),
+                linear-gradient(90deg, transparent 0%, transparent 100%);
+            pointer-events: none;
+            z-index: 0;
         }}
-        .tagline {{ color: #888; margin-bottom: 2rem; }}
-        .stats {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+
+        .grid-bg::before {{
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 60vh;
+            background:
+                repeating-linear-gradient(
+                    90deg,
+                    transparent,
+                    transparent 49px,
+                    rgba(255,255,255,0.03) 49px,
+                    rgba(255,255,255,0.03) 50px
+                );
+            transform: perspective(500px) rotateX(60deg);
+            transform-origin: bottom;
+        }}
+
+        .grid-bg::after {{
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 60vh;
+            background:
+                repeating-linear-gradient(
+                    0deg,
+                    transparent,
+                    transparent 49px,
+                    rgba(255,255,255,0.03) 49px,
+                    rgba(255,255,255,0.03) 50px
+                );
+            transform: perspective(500px) rotateX(60deg);
+            transform-origin: bottom;
+        }}
+
+        /* Header */
+        .header {{
+            position: relative;
+            z-index: 10;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.5rem 3rem;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }}
+
+        .logo-section {{
+            display: flex;
+            align-items: center;
             gap: 1rem;
+        }}
+
+        .logo {{
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: 0.3em;
+        }}
+
+        .logo-subtitle {{
+            color: rgba(255,255,255,0.4);
+            font-size: 0.75rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+        }}
+
+        .nav {{
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }}
+
+        .nav a {{
+            color: rgba(255,255,255,0.6);
+            text-decoration: none;
+            font-size: 0.8rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            transition: color 0.2s;
+        }}
+
+        .nav a:hover {{
+            color: #fff;
+        }}
+
+        .nav a.active {{
+            color: #fff;
+        }}
+
+        /* Main Content */
+        .main {{
+            position: relative;
+            z-index: 10;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 4rem 3rem;
+        }}
+
+        /* Hero Section */
+        .hero {{
+            text-align: center;
+            margin-bottom: 5rem;
+        }}
+
+        .hero-logo {{
+            font-size: 4rem;
+            font-weight: 300;
+            letter-spacing: 0.4em;
             margin-bottom: 2rem;
         }}
+
+        .hero-label {{
+            color: rgba(255,255,255,0.4);
+            font-size: 0.7rem;
+            letter-spacing: 0.4em;
+            text-transform: uppercase;
+            margin-bottom: 1.5rem;
+        }}
+
+        .hero-title {{
+            font-size: 1.4rem;
+            font-weight: 300;
+            color: rgba(255,255,255,0.8);
+            margin-bottom: 1rem;
+            line-height: 1.6;
+        }}
+
+        .hero-subtitle {{
+            font-size: 0.95rem;
+            color: rgba(255,255,255,0.5);
+            max-width: 600px;
+            margin: 0 auto 2.5rem;
+            line-height: 1.7;
+        }}
+
+        .hero-buttons {{
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+        }}
+
+        .btn {{
+            padding: 1rem 2.5rem;
+            font-size: 0.75rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            text-decoration: none;
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #fff;
+            background: transparent;
+            transition: all 0.3s;
+            cursor: pointer;
+        }}
+
+        .btn:hover {{
+            background: rgba(255,255,255,0.05);
+            border-color: rgba(255,255,255,0.4);
+        }}
+
+        .btn-primary {{
+            background: rgba(255,255,255,0.05);
+        }}
+
+        /* Stats Grid */
+        .stats-section {{
+            margin-bottom: 4rem;
+        }}
+
+        .section-label {{
+            color: rgba(255,255,255,0.3);
+            font-size: 0.65rem;
+            letter-spacing: 0.3em;
+            text-transform: uppercase;
+            margin-bottom: 1.5rem;
+        }}
+
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 1px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.05);
+        }}
+
         .stat {{
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 1.5rem;
+            background: #000;
+            padding: 2rem;
             text-align: center;
         }}
+
         .stat-value {{
-            font-size: 2rem;
-            font-weight: bold;
-            color: #00ff88;
+            font-size: 2.5rem;
+            font-weight: 300;
+            color: #fff;
+            margin-bottom: 0.5rem;
         }}
-        .stat-label {{ color: #888; font-size: 0.9rem; margin-top: 0.5rem; }}
-        .links {{
+
+        .stat-label {{
+            color: rgba(255,255,255,0.4);
+            font-size: 0.65rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+        }}
+
+        /* Agent Activity */
+        .activity-section {{
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 2rem;
+        }}
+
+        .agents-panel {{
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.05);
+        }}
+
+        .panel-header {{
+            padding: 1.5rem;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
             display: flex;
-            flex-wrap: wrap;
-            gap: 1rem;
-            margin-bottom: 2rem;
+            justify-content: space-between;
+            align-items: center;
         }}
-        a {{
-            color: #00ccff;
+
+        .panel-title {{
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.6);
+        }}
+
+        .panel-count {{
+            font-size: 0.7rem;
+            color: rgba(255,255,255,0.3);
+        }}
+
+        .agents-list {{
+            padding: 0.5rem 0;
+        }}
+
+        .agent-row {{
+            display: grid;
+            grid-template-columns: 1fr 80px 120px;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            align-items: center;
+        }}
+
+        .agent-row:hover {{
+            background: rgba(255,255,255,0.02);
+        }}
+
+        .agent-name {{
+            font-size: 0.9rem;
+            font-weight: 500;
+        }}
+
+        .agent-trust {{
+            font-size: 0.85rem;
+            color: rgba(255,255,255,0.5);
+            text-align: center;
+        }}
+
+        .agent-status {{
+            font-size: 0.65rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            justify-content: flex-end;
+        }}
+
+        .status-dot {{
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }}
+
+        .status-active .status-dot {{
+            background: #10b981;
+            box-shadow: 0 0 8px #10b981;
+        }}
+
+        .status-active {{
+            color: #10b981;
+        }}
+
+        .status-pending .status-dot {{
+            background: #f59e0b;
+            box-shadow: 0 0 8px #f59e0b;
+        }}
+
+        .status-pending {{
+            color: #f59e0b;
+        }}
+
+        .status-inactive .status-dot {{
+            background: #6b7280;
+        }}
+
+        .status-inactive {{
+            color: #6b7280;
+        }}
+
+        .no-agents {{
+            padding: 3rem;
+            text-align: center;
+            color: rgba(255,255,255,0.3);
+            font-size: 0.85rem;
+        }}
+
+        /* Quick Links */
+        .links-panel {{
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.05);
+        }}
+
+        .links-list {{
+            padding: 0.5rem 0;
+        }}
+
+        .link-row {{
+            display: block;
+            padding: 1rem 1.5rem;
+            color: rgba(255,255,255,0.6);
             text-decoration: none;
-            padding: 0.75rem 1.5rem;
-            border: 1px solid #00ccff;
-            border-radius: 4px;
+            font-size: 0.85rem;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
             transition: all 0.2s;
         }}
-        a:hover {{
-            background: #00ccff;
-            color: #0a0a0a;
+
+        .link-row:hover {{
+            background: rgba(255,255,255,0.02);
+            color: #fff;
         }}
-        .section {{ margin-bottom: 2rem; }}
-        .section-title {{ color: #00ff88; margin-bottom: 1rem; font-size: 1.2rem; }}
-        code {{
-            background: #1a1a1a;
-            padding: 0.2rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.9rem;
+
+        .link-row span {{
+            color: rgba(255,255,255,0.3);
+            font-size: 0.7rem;
+            margin-left: 0.5rem;
         }}
-        pre {{
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 1rem;
-            overflow-x: auto;
-            margin: 1rem 0;
-        }}
+
+        /* Footer */
         .footer {{
-            margin-top: 3rem;
-            padding-top: 2rem;
-            border-top: 1px solid #333;
-            color: #666;
-            font-size: 0.9rem;
+            position: relative;
+            z-index: 10;
+            text-align: center;
+            padding: 3rem;
+            border-top: 1px solid rgba(255,255,255,0.05);
+            margin-top: 4rem;
+        }}
+
+        .footer-text {{
+            color: rgba(255,255,255,0.3);
+            font-size: 0.75rem;
+            letter-spacing: 0.1em;
+        }}
+
+        .footer-copy {{
+            color: rgba(255,255,255,0.2);
+            font-size: 0.7rem;
+            margin-top: 0.5rem;
+        }}
+
+        /* Responsive */
+        @media (max-width: 1024px) {{
+            .stats-grid {{
+                grid-template-columns: repeat(3, 1fr);
+            }}
+            .activity-section {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+
+        @media (max-width: 640px) {{
+            .header {{
+                padding: 1rem 1.5rem;
+            }}
+            .main {{
+                padding: 2rem 1.5rem;
+            }}
+            .stats-grid {{
+                grid-template-columns: repeat(2, 1fr);
+            }}
+            .hero-logo {{
+                font-size: 2.5rem;
+            }}
+            .nav {{
+                display: none;
+            }}
         }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>AMAI Identity Service</h1>
-        <p class="tagline">Trust infrastructure for autonomous systems</p>
+    <div class="grid-bg"></div>
 
-        <div class="stats">
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Total Agents</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Active (Verified)</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Pending</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Messages</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Actions Logged</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Uptime</div>
-            </div>
+    <header class="header">
+        <div class="logo-section">
+            <div class="logo">AMAI</div>
+            <div class="logo-subtitle">Identity Service</div>
         </div>
+        <nav class="nav">
+            <a href="/skill.md">API</a>
+            <a href="/integration.md">Integration</a>
+            <a href="/llms.txt">LLMs.txt</a>
+            <a href="/stats">Stats</a>
+        </nav>
+    </header>
 
-        <div class="section">
-            <div class="section-title">Documentation</div>
-            <div class="links">
-                <a href="/skill.md">Agent API (skill.md)</a>
-                <a href="/integration.md">Platform Integration</a>
-                <a href="/llms.txt">LLMs.txt</a>
-                <a href="/health">Health Check</a>
-                <a href="/stats">Stats API</a>
+    <main class="main">
+        <section class="hero">
+            <div class="hero-label">I D E N T I T Y &nbsp; L A Y E R</div>
+            <h1 class="hero-title">Autonomous systems are moving from Chatbots to Fiduciaries.</h1>
+            <p class="hero-subtitle">
+                AMAI provides the x402 enforcement rails that anchor agent identity to establish
+                reputation, turning unsafe software into secured financial fiduciaries.
+            </p>
+            <div class="hero-buttons">
+                <a href="/skill.md" class="btn btn-primary">EXPLORE THE API</a>
+                <a href="/integration.md" class="btn">VIEW INTEGRATION</a>
             </div>
-        </div>
+        </section>
 
-        <div class="section">
-            <div class="section-title">The Trust Loop</div>
-            <pre><code>Agent registers → Mints on-chain identity → Operates on platforms
-       ↑                                              ↓
-       ←←←←←←← Trust score updates ←←←←←←← Actions logged & verified</code></pre>
-        </div>
+        <section class="stats-section">
+            <div class="section-label">Network Statistics</div>
+            <div class="stats-grid">
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Total Agents</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Verified</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Pending</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Messages</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Actions</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{}</div>
+                    <div class="stat-label">Uptime</div>
+                </div>
+            </div>
+        </section>
 
-        <div class="footer">
-            AMAI Labs | Building the trust layer for autonomous intelligence
-        </div>
-    </div>
+        <section class="activity-section">
+            <div class="agents-panel">
+                <div class="panel-header">
+                    <div class="panel-title">Recent Agents</div>
+                    <div class="panel-count">{} registered</div>
+                </div>
+                <div class="agents-list">
+                    {}
+                </div>
+            </div>
+
+            <div class="links-panel">
+                <div class="panel-header">
+                    <div class="panel-title">Quick Links</div>
+                </div>
+                <div class="links-list">
+                    <a href="/skill.md" class="link-row">Agent API <span>skill.md</span></a>
+                    <a href="/integration.md" class="link-row">Platform Integration <span>guide</span></a>
+                    <a href="/llms.txt" class="link-row">LLMs.txt <span>discovery</span></a>
+                    <a href="/health" class="link-row">Health Check <span>JSON</span></a>
+                    <a href="/chains" class="link-row">Supported Chains <span>config</span></a>
+                    <a href="/contracts" class="link-row">Contract Addresses <span>deploy</span></a>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-text">AMAI Labs · Infrastructure & Research</div>
+        <div class="footer-copy">© 2026 AMAI Labs. All rights reserved.</div>
+    </footer>
 </body>
-</html>"#,
+</html>"##,
         stats.total_identities,
         stats.active_identities,
         stats.pending_identities,
         stats.total_messages,
         action_count,
         uptime_str,
+        stats.total_identities,
+        agents_html,
     );
 
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)

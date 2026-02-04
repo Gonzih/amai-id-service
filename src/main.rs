@@ -36,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("Failed to load state from disk: {}", e);
     }
 
+    // Inject mock data if state is empty (demo mode)
+    state.inject_mock_data().await;
+
     // Spawn persistence worker
     let persister = state.spawn_persister();
 
