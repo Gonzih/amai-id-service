@@ -293,7 +293,7 @@ impl AppState {
             soulchain_seq: 0,
         };
 
-        // Create eldest soulchain link
+        // Create genesis soulchain link (eldest)
         let eldest = eldest_body(
             public_key.kid.clone(),
             public_key.key_type.clone(),
@@ -302,7 +302,7 @@ impl AppState {
 
         let link = self
             .soulchain
-            .append(&id, eldest, req.signature.clone(), &public_key)
+            .append_genesis(&id, eldest, req.signature.clone(), &public_key)
             .await?;
 
         let mut identity = identity;

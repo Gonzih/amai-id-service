@@ -128,6 +128,53 @@ impl SoulchainStore {
         Ok(link)
     }
 
+    /// Append eldest (genesis) link without signature verification
+    ///
+    /// Used during registration where identity verification has already been done
+    /// via the registration signature. The registration signature is stored as
+    /// proof of key ownership.
+    pub async fn append_genesis(
+        &self,
+        identity_id: &IdentityId,
+        body: SoulchainBody,
+        registration_signature: String,
+        signing_key: &PublicKey,
+    ) -> ApiResult<SoulchainLink> {
+        let mut chains = self.chains.write().await;
+        let chain = chains.entry(*identity_id).or_insert_with(Vec::new);
+
+        // Genesis must be first
+        if !chain.is_empty() {
+            return Err(ApiError::soulchain("Genesis link must be first"));
+        }
+
+        // Must be Eldest type
+        if !matches!(body, SoulchainBody::Eldest { .. }) {
+            return Err(ApiError::soulchain("Genesis link must be 'eldest' type"));
+        }
+
+        // Create the link body JSON for hashing
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| ApiError::internal(e.to_string()))?;
+
+        // Compute body hash
+        let curr = sha256_hex(body_json.as_bytes());
+
+        let link = SoulchainLink {
+            seqno: 1,
+            prev: None,
+            curr,
+            body,
+            sig: registration_signature, // Store registration signature as proof
+            signing_kid: signing_key.kid.clone(),
+            ctime: Utc::now(),
+        };
+
+        chain.push(link.clone());
+
+        Ok(link)
+    }
+
     /// Verify entire soulchain integrity
     pub async fn verify_chain(
         &self,
