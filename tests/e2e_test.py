@@ -89,6 +89,58 @@ class AMAIAgent:
         response = requests.get(f"{self.service_url}/identity/{name_or_id}/keys")
         return response.json()
 
+    def send_message(self, to_name: str, content: str, message_type: str = "text") -> dict:
+        """Send a message to another agent."""
+        # Sign the content
+        content_signature = self.sign_message(content)
+
+        # Need to get our kid from our keys
+        keys_result = self.get_keys(self.name)
+        if not keys_result.get("success"):
+            raise Exception(f"Failed to get own keys: {keys_result}")
+        kid = keys_result["data"]["keys"][0]["kid"]
+
+        payload = {
+            "content": content,
+            "content_signature": content_signature,
+            "kid": kid,
+            "message_type": message_type
+        }
+
+        response = requests.post(
+            f"{self.service_url}/identity/{to_name}/messages",
+            json=payload
+        )
+        return response.json()
+
+    def get_messages(self, from_name: str = None, unread: bool = None) -> dict:
+        """Get messages for this agent (authenticated)."""
+        # Need to get our kid
+        keys_result = self.get_keys(self.name)
+        if not keys_result.get("success"):
+            raise Exception(f"Failed to get own keys: {keys_result}")
+        kid = keys_result["data"]["keys"][0]["kid"]
+
+        # Sign our identity name to prove ownership
+        signature = self.sign_message(self.name)
+        nonce = secrets.token_hex(32)
+
+        payload = {
+            "kid": kid,
+            "signature": signature,
+            "nonce": nonce
+        }
+        if from_name:
+            payload["from"] = from_name
+        if unread is not None:
+            payload["unread"] = unread
+
+        response = requests.post(
+            f"{self.service_url}/identity/{self.name}/messages/inbox",
+            json=payload
+        )
+        return response.json()
+
 
 def test_health(service_url: str) -> bool:
     """Test health endpoint."""
@@ -273,22 +325,72 @@ def test_invalid_signature(service_url: str) -> bool:
         return False
 
 
-def test_list_identities(service_url: str) -> bool:
-    """Test listing identities."""
-    print("\n[TEST] List identities...")
+def test_messaging(agent1: AMAIAgent, agent2: AMAIAgent) -> bool:
+    """Test agent-to-agent messaging with full conversation."""
+    print("\n[TEST] Agent messaging (conversation)...")
 
-    response = requests.get(f"{service_url}/identities?limit=10")
-    result = response.json()
+    # Simulate a multi-turn conversation
+    conversation = [
+        (agent1, agent2, "Hey, I need you to process some data for me."),
+        (agent2, agent1, "Acknowledged. What kind of data processing do you need?"),
+        (agent1, agent2, "Calculate the trust score delta for entity X-42."),
+        (agent2, agent1, "Processing... Entity X-42 has trust delta of +0.15 based on recent attestations."),
+        (agent1, agent2, "Great. Can you also verify the soulchain integrity?"),
+        (agent2, agent1, "Soulchain verified. 12 entries, all signatures valid, no gaps detected."),
+        (agent1, agent2, "Perfect. Task complete. Logging to soulchain."),
+        (agent2, agent1, "Confirmed. Standing by for next task."),
+    ]
 
-    if result.get("success"):
-        identities = result["data"]
-        print(f"  Found {len(identities)} identities (limit 10)")
-        for identity in identities[:3]:
-            print(f"    - {identity['name']} (trust: {identity['trust_score']})")
-        return True
-    else:
-        print(f"  Failed: {result}")
+    print(f"  Sending {len(conversation)} messages back and forth...")
+
+    for i, (sender, recipient, content) in enumerate(conversation):
+        result = sender.send_message(recipient.name, content)
+        if not result.get("success"):
+            print(f"  Message {i+1} failed: {result}")
+            return False
+        msg_id = result["data"]["id"]
+        print(f"    [{i+1}/{len(conversation)}] {sender.name[:15]:15} -> {recipient.name[:15]:15} (ID: {msg_id[:8]}...)")
+
+    # Agent 1 checks inbox (should have 4 messages from Agent 2)
+    print("\n  Agent 1 checking inbox...")
+    result = agent1.get_messages()
+
+    if not result.get("success"):
+        print(f"  Agent 1 failed to get messages: {result}")
         return False
+
+    messages = result["data"]
+    agent1_received = [m for m in messages if m["from"] == agent2.identity_id]
+    print(f"    Total messages: {len(messages)}, from Agent 2: {len(agent1_received)}")
+
+    if len(agent1_received) < 4:
+        print(f"  FAILED: Agent 1 should have 4 messages from Agent 2, got {len(agent1_received)}")
+        return False
+
+    # Agent 2 checks inbox (should have 4 messages from Agent 1)
+    print("  Agent 2 checking inbox...")
+    result = agent2.get_messages()
+
+    if not result.get("success"):
+        print(f"  Agent 2 failed to get messages: {result}")
+        return False
+
+    messages = result["data"]
+    agent2_received = [m for m in messages if m["from"] == agent1.identity_id]
+    print(f"    Total messages: {len(messages)}, from Agent 1: {len(agent2_received)}")
+
+    if len(agent2_received) < 4:
+        print(f"  FAILED: Agent 2 should have 4 messages from Agent 1, got {len(agent2_received)}")
+        return False
+
+    # Show last few messages
+    print("\n  Recent messages in Agent 2's inbox:")
+    for msg in agent2_received[-3:]:
+        content_preview = msg["content"][:60] + "..." if len(msg["content"]) > 60 else msg["content"]
+        print(f"    - {content_preview}")
+
+    print("\n  Conversation test passed!")
+    return True
 
 
 def run_tests(service_url: str) -> bool:
@@ -320,9 +422,9 @@ def run_tests(service_url: str) -> bool:
 
     results.append(("Identity Lookup", test_identity_lookup(agent1, agent2)))
     results.append(("Key Exchange", test_key_exchange(agent1, agent2)))
+    results.append(("Messaging", test_messaging(agent1, agent2)))
     results.append(("Duplicate Rejection", test_duplicate_registration(service_url, agent1.name)))
     results.append(("Invalid Signature", test_invalid_signature(service_url)))
-    results.append(("List Identities", test_list_identities(service_url)))
 
     # Summary
     print(f"\n{'='*60}")

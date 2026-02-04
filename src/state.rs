@@ -441,6 +441,111 @@ impl AppState {
             }
         }
     }
+
+    // ============ Messaging Operations ============
+
+    /// Send a message from one identity to another
+    pub fn send_message(
+        &self,
+        from_id: IdentityId,
+        to_id: IdentityId,
+        content: String,
+        content_signature: String,
+        message_type: MessageType,
+    ) -> ApiResult<Message> {
+        // Verify both identities exist
+        if !self.identities.contains_key(&from_id) {
+            return Err(ApiError::not_found("Sender identity not found"));
+        }
+        if !self.identities.contains_key(&to_id) {
+            return Err(ApiError::not_found("Recipient identity not found"));
+        }
+
+        let message = Message {
+            id: Uuid::new_v4(),
+            from: from_id,
+            to: to_id,
+            content,
+            signature: content_signature,
+            message_type,
+            timestamp: Utc::now(),
+            delivered: false,
+            read: false,
+        };
+
+        // Store message in recipient's inbox
+        self.messages
+            .entry(to_id)
+            .or_insert_with(Vec::new)
+            .push(message.clone());
+
+        // Update stats
+        self.total_messages.fetch_add(1, Ordering::SeqCst);
+
+        // Update sender's message count
+        if let Some(mut identity) = self.identities.get_mut(&from_id) {
+            identity.messages_sent += 1;
+            identity.last_active = Utc::now();
+        }
+
+        // Update recipient's message count
+        if let Some(mut identity) = self.identities.get_mut(&to_id) {
+            identity.messages_received += 1;
+        }
+
+        self.mark_dirty();
+        tracing::info!("Message sent from {} to {}", from_id, to_id);
+
+        Ok(message)
+    }
+
+    /// Get messages for an identity
+    pub fn get_messages(
+        &self,
+        identity_id: &IdentityId,
+        from_filter: Option<IdentityId>,
+        unread_only: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Message> {
+        self.messages
+            .get(identity_id)
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        if let Some(from) = from_filter {
+                            if m.from != from {
+                                return false;
+                            }
+                        }
+                        if unread_only && m.read {
+                            return false;
+                        }
+                        true
+                    })
+                    .rev() // Most recent first
+                    .skip(offset)
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Mark a message as read
+    pub fn mark_message_read(&self, identity_id: &IdentityId, message_id: Uuid) -> ApiResult<()> {
+        if let Some(mut msgs) = self.messages.get_mut(identity_id) {
+            for msg in msgs.iter_mut() {
+                if msg.id == message_id {
+                    msg.read = true;
+                    msg.delivered = true;
+                    self.mark_dirty();
+                    return Ok(());
+                }
+            }
+        }
+        Err(ApiError::not_found("Message not found"))
+    }
 }
 
 #[derive(Serialize, Deserialize)]

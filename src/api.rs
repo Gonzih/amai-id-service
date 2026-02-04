@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -22,7 +22,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/register", post(register))
         .route("/identity/:id_or_name", get(get_identity))
         .route("/identity/:id_or_name/keys", get(get_identity_keys))
-        .route("/identities", get(list_identities))
+        .route("/identity/:id_or_name/messages", post(send_message))
+        .route("/identity/:id_or_name/messages/inbox", post(get_messages_auth))
         .route("/llms.txt", get(llms_txt))
         .route("/.well-known/llms.txt", get(llms_txt))
         .route("/skill.md", get(skill_md))
@@ -75,37 +76,102 @@ async fn get_identity_keys(
     })))
 }
 
+// ============ Messaging Endpoints ============
+
 #[derive(serde::Deserialize)]
-struct ListQuery {
+struct SendMessageBody {
+    /// Message content
+    content: String,
+    /// Signature of content by sender's key
+    content_signature: String,
+    /// Sender's key ID
+    kid: String,
+    #[serde(default)]
+    message_type: MessageType,
+}
+
+async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Path(recipient): Path<String>,
+    Json(body): Json<SendMessageBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Authenticate sender by key ID
+    let sender = state.authenticate(&body.kid)?;
+
+    // Resolve recipient
+    let recipient_id = state.resolve_identity(&recipient)?;
+
+    // Send the message
+    let message = state.send_message(
+        sender.id,
+        recipient_id,
+        body.content,
+        body.content_signature,
+        body.message_type,
+    )?;
+
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(message))))
+}
+
+#[derive(serde::Deserialize)]
+struct GetMessagesBody {
+    /// Key ID to authenticate
+    kid: String,
+    /// Signature of the identity name being accessed (proves ownership)
+    signature: String,
+    /// Nonce for replay protection
+    nonce: String,
+    /// Optional filters
+    from: Option<String>,
+    unread: Option<bool>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
 
-async fn list_identities(
+async fn get_messages_auth(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListQuery>,
-) -> impl IntoResponse {
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
-    let identities = state.list_identities(limit, offset);
-    Json(ApiResponse::success(identities))
+    Path(id_or_name): Path<String>,
+    Json(body): Json<GetMessagesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Authenticate - verify the requester owns this identity
+    let identity = state.authenticate(&body.kid)?;
+    let requested_id = state.resolve_identity(&id_or_name)?;
+
+    // Must be requesting own messages
+    if identity.id != requested_id {
+        return Err(ApiError::Unauthorized);
+    }
+
+    // Verify nonce hasn't been used
+    if !state.nonces.check_and_mark(&body.nonce) {
+        return Err(ApiError::ReplayDetected);
+    }
+
+    // Verify signature of the identity name (proves they want to access this mailbox)
+    let key = state.get_key(&body.kid)?;
+    let parsed_key = crate::crypto::parse_public_key(&key.public_key_pem, &key.key_type)
+        .map_err(|e| ApiError::signature(e.to_string()))?;
+    crate::crypto::verify_signature(&parsed_key, id_or_name.as_bytes(), &body.signature)
+        .map_err(|e| ApiError::signature(format!("Invalid signature: {}", e)))?;
+
+    let from_id = if let Some(from) = body.from {
+        Some(state.resolve_identity(&from)?)
+    } else {
+        None
+    };
+
+    let limit = body.limit.unwrap_or(50).min(100);
+    let offset = body.offset.unwrap_or(0);
+    let unread_only = body.unread.unwrap_or(false);
+
+    let messages = state.get_messages(&requested_id, from_id, unread_only, limit, offset);
+    Ok(Json(ApiResponse::success(messages)))
 }
 
 // ============ Index Page ============
 
 async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let stats = state.stats().await;
-    let uptime = state.start_time.elapsed().as_secs();
-
-    let uptime_str = if uptime < 60 {
-        format!("{}s", uptime)
-    } else if uptime < 3600 {
-        format!("{}m", uptime / 60)
-    } else if uptime < 86400 {
-        format!("{}h", uptime / 3600)
-    } else {
-        format!("{}d", uptime / 86400)
-    };
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -114,43 +180,69 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AMAI Identity Service</title>
+    <meta name="description" content="Cryptographic identity for autonomous agents. Soul-Bound Keys and Soulchain reputation.">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: system-ui, sans-serif; background: #000; color: #fff; min-height: 100vh; padding: 2rem; }}
-        .container {{ max-width: 800px; margin: 0 auto; }}
-        h1 {{ font-size: 2rem; letter-spacing: 0.3em; margin-bottom: 1rem; }}
-        .tagline {{ color: #666; margin-bottom: 2rem; }}
-        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }}
-        .stat {{ background: #111; padding: 1.5rem; text-align: center; border: 1px solid #222; }}
-        .stat-value {{ font-size: 2rem; font-weight: 300; }}
-        .stat-label {{ color: #666; font-size: 0.8rem; margin-top: 0.5rem; text-transform: uppercase; letter-spacing: 0.1em; }}
-        .links {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
-        a {{ color: #fff; text-decoration: none; padding: 0.75rem 1.5rem; border: 1px solid #333; }}
-        a:hover {{ background: #111; }}
-        .footer {{ margin-top: 3rem; color: #444; font-size: 0.8rem; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; background: #000; color: #fff; min-height: 100vh; display: flex; flex-direction: column; }}
+        .header {{ padding: 1rem 1.5rem; border-bottom: 1px solid rgba(255,255,255,0.1); }}
+        .header-content {{ max-width: 900px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }}
+        .header-left {{ font-size: 0.65rem; letter-spacing: 0.3em; text-transform: uppercase; color: rgba(255,255,255,0.4); }}
+        .header-right {{ display: flex; gap: 1.5rem; }}
+        .header-right a {{ font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase; color: rgba(255,255,255,0.6); text-decoration: none; transition: color 0.2s; }}
+        .header-right a:hover {{ color: rgba(255,255,255,0.9); }}
+        .main {{ flex: 1; display: flex; align-items: center; justify-content: center; padding: 2rem; }}
+        .container {{ max-width: 600px; text-align: center; }}
+        h1 {{ font-size: 2.5rem; font-weight: 300; letter-spacing: 0.4em; margin-bottom: 1.5rem; }}
+        .subtitle {{ font-size: 0.65rem; letter-spacing: 0.3em; text-transform: uppercase; color: rgba(255,255,255,0.4); margin-bottom: 1rem; }}
+        .tagline {{ color: rgba(255,255,255,0.7); font-size: 0.9rem; font-weight: 300; line-height: 1.6; margin-bottom: 0.75rem; }}
+        .tagline-small {{ color: rgba(255,255,255,0.5); font-size: 0.8rem; font-weight: 300; line-height: 1.6; margin-bottom: 2.5rem; }}
+        .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; margin-bottom: 2.5rem; }}
+        .stat {{ text-align: center; }}
+        .stat-value {{ font-size: 2rem; font-weight: 300; color: #fff; }}
+        .stat-label {{ font-size: 0.6rem; letter-spacing: 0.15em; text-transform: uppercase; color: rgba(255,255,255,0.4); margin-top: 0.5rem; }}
+        .links {{ display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }}
+        .links a {{ font-size: 0.75rem; color: rgba(255,255,255,0.7); text-decoration: none; padding: 0.75rem 1.5rem; border: 1px solid rgba(255,255,255,0.2); transition: all 0.2s; letter-spacing: 0.15em; text-transform: uppercase; }}
+        .links a:hover {{ color: #fff; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.05); }}
+        .footer {{ padding: 1.5rem; border-top: 1px solid rgba(255,255,255,0.1); text-align: center; }}
+        .footer p {{ font-size: 0.7rem; color: rgba(255,255,255,0.3); letter-spacing: 0.1em; }}
+        .footer p + p {{ margin-top: 0.25rem; font-size: 0.6rem; }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>AMAI</h1>
-        <p class="tagline">Cryptographic identity for autonomous agents</p>
-        <div class="stats">
-            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Agents</div></div>
-            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Active</div></div>
-            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Soulchain Entries</div></div>
-            <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Uptime</div></div>
+    <div class="header">
+        <div class="header-content">
+            <div class="header-left">AMAI Labs · Identity Service</div>
+            <div class="header-right">
+                <a href="/skill.md">API</a>
+                <a href="/llms.txt">LLMs.txt</a>
+                <a href="/stats">Stats</a>
+            </div>
         </div>
-        <div class="links">
-            <a href="/skill.md">API Documentation</a>
-            <a href="/llms.txt">LLMs.txt</a>
-            <a href="/health">Health</a>
-            <a href="/stats">Stats</a>
-        </div>
-        <div class="footer">AMAI Labs - Identity for Autonomous Agents</div>
     </div>
+    <div class="main">
+        <div class="container">
+            <div class="subtitle">Identity Infrastructure</div>
+            <h1>AMAI</h1>
+            <p class="tagline">Cryptographic identity for autonomous agents.</p>
+            <p class="tagline-small">Soul-Bound Keys anchor persistent identity. Soulchain builds immutable reputation.</p>
+            <div class="stats">
+                <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Agents</div></div>
+                <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Active</div></div>
+                <div class="stat"><div class="stat-value">{}</div><div class="stat-label">Soulchain Entries</div></div>
+            </div>
+            <div class="links">
+                <a href="/skill.md">Explore API</a>
+                <a href="https://amai.net">AMAI Labs</a>
+            </div>
+        </div>
+    </div>
+    <footer class="footer">
+        <p>AMAI Labs · Infrastructure & Research</p>
+        <p>&copy; 2026 AMAI Labs</p>
+    </footer>
 </body>
 </html>"##,
-        stats.total_identities, stats.active_identities, stats.total_soulchain_entries, uptime_str,
+        stats.total_identities, stats.active_identities, stats.total_soulchain_entries,
     );
 
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
