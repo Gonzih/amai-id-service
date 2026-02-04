@@ -13,9 +13,9 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm -rf src
 
-# Copy actual source and docs
+# Copy actual source and assets
 COPY src ./src
-COPY skill.md llms.txt ./
+COPY skill.md llms.txt amai-logo.png ./
 
 # Build for release
 RUN touch src/main.rs && cargo build --release
