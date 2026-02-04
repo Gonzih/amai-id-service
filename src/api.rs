@@ -27,6 +27,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/llms.txt", get(llms_txt))
         .route("/.well-known/llms.txt", get(llms_txt))
         .route("/skill.md", get(skill_md))
+        .route("/assets/amai-logo.png", get(logo_png))
         .with_state(state)
 }
 
@@ -192,7 +193,8 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .header-right a:hover {{ color: rgba(255,255,255,0.9); }}
         .main {{ flex: 1; display: flex; align-items: center; justify-content: center; padding: 2rem; }}
         .container {{ max-width: 600px; text-align: center; }}
-        h1 {{ font-size: 2.5rem; font-weight: 300; letter-spacing: 0.4em; margin-bottom: 1.5rem; }}
+        .logo {{ height: 3rem; width: auto; margin-bottom: 1.5rem; filter: brightness(1.1); }}
+        @media (min-width: 768px) {{ .logo {{ height: 5rem; }} }}
         .subtitle {{ font-size: 0.65rem; letter-spacing: 0.3em; text-transform: uppercase; color: rgba(255,255,255,0.4); margin-bottom: 1rem; }}
         .tagline {{ color: rgba(255,255,255,0.7); font-size: 0.9rem; font-weight: 300; line-height: 1.6; margin-bottom: 0.75rem; }}
         .tagline-small {{ color: rgba(255,255,255,0.5); font-size: 0.8rem; font-weight: 300; line-height: 1.6; margin-bottom: 2.5rem; }}
@@ -222,7 +224,7 @@ async fn index_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     <div class="main">
         <div class="container">
             <div class="subtitle">Identity Infrastructure</div>
-            <h1>AMAI</h1>
+            <img src="/assets/amai-logo.png" alt="AMAI" class="logo">
             <p class="tagline">Cryptographic identity for autonomous agents.</p>
             <p class="tagline-small">Soul-Bound Keys anchor persistent identity. Soulchain builds immutable reputation.</p>
             <div class="stats">
@@ -261,5 +263,12 @@ async fn skill_md() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         include_str!("../skill.md"),
+    )
+}
+
+async fn logo_png() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../amai-logo.png").as_slice(),
     )
 }
