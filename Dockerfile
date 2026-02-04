@@ -15,7 +15,7 @@ RUN rm -rf src
 
 # Copy actual source and docs
 COPY src ./src
-COPY skill.md integration.md llms.txt ./
+COPY skill.md llms.txt ./
 
 # Build for release
 RUN touch src/main.rs && cargo build --release
