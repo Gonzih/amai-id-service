@@ -20,6 +20,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/register", post(register))
+        .route("/verify", post(verify_signature_endpoint))
         .route("/identity/:id_or_name", get(get_identity))
         .route("/identity/:id_or_name/keys", get(get_identity_keys))
         .route("/identity/:id_or_name/messages", post(send_message))
@@ -74,6 +75,72 @@ async fn get_identity_keys(
         keys: keys.iter().map(PublicKeyInfo::from).collect(),
         soulchain_hash: identity.soulchain_hash,
         soulchain_seq: identity.soulchain_seq,
+    })))
+}
+
+// ============ Verify Endpoint (Inter-Service Auth) ============
+
+/// Request body for signature verification.
+/// Other microservices call this to authenticate agents.
+#[derive(serde::Deserialize)]
+struct VerifyRequest {
+    /// The payload that was signed (raw JSON string or any string)
+    payload: String,
+    /// Base64-encoded signature of the payload
+    signature: String,
+    /// Key ID used for signing
+    kid: String,
+    /// Timestamp for freshness check
+    timestamp: chrono::DateTime<chrono::Utc>,
+    /// Nonce for replay protection
+    nonce: String,
+}
+
+/// Successful verification response
+#[derive(serde::Serialize)]
+struct VerifyResponse {
+    verified: bool,
+    identity_id: IdentityId,
+    name: String,
+    kid: String,
+    trust_score: f64,
+}
+
+async fn verify_signature_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // 1. Check timestamp freshness
+    let now = chrono::Utc::now();
+    let skew = chrono::Duration::seconds(state.config.max_clock_skew as i64);
+    if req.timestamp < now - skew || req.timestamp > now + skew {
+        return Err(ApiError::TimestampInvalid);
+    }
+
+    // 2. Check nonce for replay
+    if !state.nonces.check_and_mark(&req.nonce) {
+        return Err(ApiError::ReplayDetected);
+    }
+
+    // 3. Look up key and identity
+    let key = state.get_key(&req.kid)?;
+    if key.revoked {
+        return Err(ApiError::signature("Key has been revoked"));
+    }
+    let identity = state.authenticate(&req.kid)?;
+
+    // 4. Verify signature against payload bytes
+    let parsed_key = crate::crypto::parse_public_key(&key.public_key_pem, &key.key_type)
+        .map_err(|e| ApiError::signature(e.to_string()))?;
+    crate::crypto::verify_signature(&parsed_key, req.payload.as_bytes(), &req.signature)
+        .map_err(|e| ApiError::signature(format!("Signature verification failed: {}", e)))?;
+
+    Ok(Json(ApiResponse::success(VerifyResponse {
+        verified: true,
+        identity_id: identity.id,
+        name: identity.name,
+        kid: req.kid,
+        trust_score: identity.trust_score,
     })))
 }
 

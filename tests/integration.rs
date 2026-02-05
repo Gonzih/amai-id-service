@@ -505,3 +505,124 @@ async fn test_message_types() {
     let inbox = receiver.get_messages(&client, &base_url).await;
     assert_eq!(inbox["data"].as_array().unwrap().len(), 4);
 }
+
+// ============ Verify Endpoint Tests ============
+
+#[tokio::test]
+async fn test_verify_valid_signature() {
+    let (addr, _state) = helpers::spawn_test_server().await;
+    let base_url = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    let mut agent = helpers::TestAgent::new("verify-agent");
+    let reg = agent.register(&client, &base_url).await;
+    assert_eq!(reg["success"], true);
+    agent.get_keys(&client, &base_url).await;
+
+    // Sign a payload and verify via /verify
+    let payload_str = r#"{"action":"trade","symbol":"BTC/USDT"}"#;
+    let signature = agent.sign(payload_str.as_bytes());
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    let nonce = format!("{:064x}", rand::random::<u128>());
+
+    let verify_req = serde_json::json!({
+        "payload": payload_str,
+        "signature": signature,
+        "kid": agent.kid.as_ref().unwrap(),
+        "timestamp": timestamp,
+        "nonce": nonce
+    });
+
+    let resp = client
+        .post(format!("{}/verify", base_url))
+        .json(&verify_req)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["verified"], true);
+    assert_eq!(body["data"]["name"], "verify-agent");
+    assert_eq!(body["data"]["kid"], agent.kid.as_ref().unwrap().as_str());
+    assert!(body["data"]["identity_id"].is_string());
+    assert!(body["data"]["trust_score"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn test_verify_invalid_signature() {
+    let (addr, _state) = helpers::spawn_test_server().await;
+    let base_url = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    let mut agent = helpers::TestAgent::new("verify-bad-sig");
+    agent.register(&client, &base_url).await;
+    agent.get_keys(&client, &base_url).await;
+
+    // Sign one payload but send a different one
+    let wrong_sig = agent.sign(b"different payload");
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    let nonce = format!("{:064x}", rand::random::<u128>());
+
+    let verify_req = serde_json::json!({
+        "payload": "actual payload that was not signed",
+        "signature": wrong_sig,
+        "kid": agent.kid.as_ref().unwrap(),
+        "timestamp": timestamp,
+        "nonce": nonce
+    });
+
+    let resp = client
+        .post(format!("{}/verify", base_url))
+        .json(&verify_req)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+}
+
+#[tokio::test]
+async fn test_verify_replay_rejected() {
+    let (addr, _state) = helpers::spawn_test_server().await;
+    let base_url = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    let mut agent = helpers::TestAgent::new("verify-replay");
+    agent.register(&client, &base_url).await;
+    agent.get_keys(&client, &base_url).await;
+
+    let payload_str = "test replay";
+    let signature = agent.sign(payload_str.as_bytes());
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    let nonce = format!("{:064x}", rand::random::<u128>());
+
+    let verify_req = serde_json::json!({
+        "payload": payload_str,
+        "signature": signature,
+        "kid": agent.kid.as_ref().unwrap(),
+        "timestamp": timestamp,
+        "nonce": nonce
+    });
+
+    // First request should succeed
+    let resp = client
+        .post(format!("{}/verify", base_url))
+        .json(&verify_req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Same nonce should be rejected (replay)
+    let resp = client
+        .post(format!("{}/verify", base_url))
+        .json(&verify_req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
